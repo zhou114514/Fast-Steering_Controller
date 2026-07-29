@@ -1,0 +1,116 @@
+读取电压
+{
+	UpdateData(true);
+		int address_ma;//地址码
+		int bao_long;  //包长
+		int zhilingma_B3;//指令码
+		int zhilingma_B4;//指令码
+		int channleType;
+     
+        address_ma = Now_control_mcu_address;   //地址码
+		bao_long = 7;    //包长
+		zhilingma_B3 = 5; //指令码
+	    zhilingma_B4 = 0; //指令码
+		channleType=0;
+
+		SendArray_ReadDataChannel(address_ma,//地址码
+						 bao_long,  //包长
+						 zhilingma_B3,//指令码
+						 zhilingma_B4,//指令码
+						 channleType);//通道
+
+	/*
+		Sleep(100);//停顿10s钟
+		double tmp_readData=0;
+		tmp_readData = SendArray_ReadDataChannel_Real(11,0);
+		CString str;
+		str.Format("%.3f",tmp_readData);
+		GetDlgItem(IDC_REAL_DATA_01)->SetWindowText(str);
+		*/
+
+}
+
+//读取下位机 电压或位移命令
+void CXE_DoITDlg::SendArray_ReadDataChannel(    int address_ma,//地址码
+									  int bao_long,  //包长
+									  int zhilingma_B3,//指令码
+									  int zhilingma_B4,
+									  int channleType)//指令码									
+{
+	CByteArray array; 
+	array.RemoveAll();
+    
+	array.SetSize(bao_long);
+
+	unsigned check;
+	array.SetAt(0,0xaa);//起始位
+
+	array.SetAt(1,address_ma); //地址吗
+	array.SetAt(2,bao_long);//命令长度
+	array.SetAt(3,zhilingma_B3);//指令码1
+	array.SetAt(4,zhilingma_B4);//指令码2
+	array.SetAt(5,channleType);//通道
+	check=0;
+	for(int i=0;i<(bao_long-1);i++)
+		check=check^array.GetAt(i);
+    array.SetAt(bao_long-1,check);
+	//////////////
+    m_Serial_Volt.SetOutput(COleVariant(array));
+}
+
+double CXE_DoITDlg::SendArray_ReadDataChannel_Real(int bao_long,int channelType) //读取开闭环数据
+{
+	//读出 放在strRXData中
+	
+	float temp_data_real=-1.0;
+	VARIANT variant_inp;
+	COleSafeArray safearray_inp;
+	LONG len,k;
+	len=0;
+	BYTE rxdata[2048]; //设置BYTE数组 An 8-bit integerthat is not signed.
+	CString strtemp;
+	CByteArray strRXData;
+	variant_inp=m_Serial_Volt.GetInput();   //读缓冲区,//com口
+	safearray_inp=variant_inp;           //VARIANT型变量转换为ColeSafeArray型变量
+	len=safearray_inp.GetOneDimSize(); //得到有效数据长度
+	for(k=0;k<len;k++)
+	safearray_inp.GetElement(&k,rxdata+k);//转换为BYTE型数组
+	strRXData.SetSize(1024);
+	unsigned char tmp_arr[15];
+	for(k=0;k<len;k++)             //将数组转换为Cstring型变量
+	{
+		BYTE bt=*(unsigned char*)(rxdata+k);      //字符型
+		//strtemp.Format("%c",bt);         //将字符送入临时变量strtemp存放
+		strRXData.SetAt(k,bt);    //加入接收编辑框对应字符串   
+		tmp_arr[k]= bt;
+	}  
+    
+
+
+	    double ReadTmpData;
+		if(strRXData.GetAt(0)==0xaa)	
+		{	unsigned char check=0;
+		    strRXData.GetAt(0);
+			for(int i=0;i<(bao_long-1);i++)
+			{
+				check=check^(strRXData.GetAt(i));
+			}
+			if((check==strRXData.GetAt(bao_long-1))&&(strRXData.GetAt(5)==channelType))//校验正确
+			{
+				//将数据转换
+				ReadTmpData = CalData(
+					          strRXData.GetAt(6),
+					          strRXData.GetAt(7),
+						      strRXData.GetAt(8),
+						      strRXData.GetAt(9));
+			}
+		}
+			else 
+			{
+				 AfxMessageBox("读取电压/位移数据失败!");
+				 ReadTmpData = -10;
+				 m_Serial_Volt.GetInput();
+			}	  
+	m_Serial_Volt.GetInput();
+	return ReadTmpData;
+}

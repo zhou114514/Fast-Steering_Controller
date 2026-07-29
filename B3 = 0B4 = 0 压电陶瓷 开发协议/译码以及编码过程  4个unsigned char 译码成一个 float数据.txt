@@ -1,0 +1,40 @@
+//译码过程
+double CXE_DoITDlg::CalData(unsigned char kk0,unsigned char kk1,unsigned char kk2,unsigned char kk3)
+{
+	double d;
+	if(kk0&0x80)
+	{kk0-=0x80;
+	  d=(double)(kk0*256+kk1+(kk2*256+kk3)*0.0001);
+      d*=(-1);
+	}
+    else
+	{
+		d=(double)(kk0*256+kk1+(kk2*256+kk3)*0.0001);
+	}
+	return d;
+}
+///编码过程
+unsigned char* CXE_DoITDlg::DataAnla(double f,unsigned char kk[4])
+{ 
+//	if(chenfeng==1)sprintf(buf,"%d",addr_save);
+	if(f<0)//f中的内容为负数
+	{
+	 f*=(-1);//将F中的内容转换为正数
+     int a=int(f);
+	  kk[0]=a/256+0x80;//将F中的内容转换为负数
+	  kk[1]=a%256;
+	  a=int((f-a)*10000);
+	  kk[2]=a/256;
+	  kk[3]=a%256;
+	}
+	else
+	{
+	  int a=int(f);
+	  kk[0]=a/256;
+	  kk[1]=a%256;
+	  a=int((f-a+0.000001)*10000);
+	  kk[2]=a/256;
+	  kk[3]=a%256;
+	}	
+	return kk;
+}

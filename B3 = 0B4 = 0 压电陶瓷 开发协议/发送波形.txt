@@ -1,0 +1,89 @@
+void CXE_DoITDlg::OnBtnWaveMultVolt() 
+{
+	// TODO: Add your control notification handler code here
+			UpdateData(true);
+		//m_Wave_Type;
+
+		int address_ma;//地址码
+		int bao_long;  //包长
+		int zhilingma_B3;//指令码
+		int zhilingma_B4;//指令码
+		int channel_num;//通道数
+		unsigned char waveType;//波形类型
+		unsigned char ffeng[4];//峰峰值
+		unsigned char plv[4];//频率
+		unsigned char pzhi[4];//偏置
+
+
+		double tmp_ffeng;
+		double tmp_plv;
+		double tmp_pzhi;
+		//赋值
+        tmp_ffeng = m_ffeng;
+        tmp_plv = m_plv;
+        tmp_pzhi = m_pzhi;
+        //转换
+		DataAnla(tmp_ffeng,ffeng);
+		DataAnla(tmp_plv,plv);
+		DataAnla(tmp_pzhi,pzhi);
+        
+        address_ma = Now_control_mcu_address;   //地址码
+		bao_long = 20;    //包长
+		zhilingma_B3 = 15; //指令码
+	    zhilingma_B4 = 0; //指令码
+		channel_num = 0;  //通道数
+        waveType = 	m_iWaveType_char; 	//波类型: 'Z':正弦波,'F':方波,'S':三角波,'J':锯齿波
+
+    
+
+	    SendArray_Wave_Mult( address_ma,//地址码
+							bao_long,  //包长
+							zhilingma_B3,//指令码
+							zhilingma_B4,//指令码
+							channel_num,//通道数
+							waveType,//波形类型
+							ffeng,//峰峰值
+							plv,//频率
+							pzhi);//偏置
+}
+
+
+//发送单路波形数据
+void CXE_DoITDlg::SendArray_Wave_Mult(        int address_ma,//地址码
+											  int bao_long,  //包长
+											  int zhilingma_B3,//指令码
+											  int zhilingma_B4,//指令码
+											  int channel_num,//通道数
+											  unsigned char waveType,//波形类型
+											  unsigned char ffeng[4],//峰峰值
+											  unsigned char plv[4],//频率
+											  unsigned char pzhi[4])//偏置
+{
+	CByteArray array; 
+	array.RemoveAll();
+    
+	array.SetSize(bao_long);
+
+	unsigned check;
+	array.SetAt(0,0xaa);//起始位
+
+	array.SetAt(1,address_ma); //地址吗
+	array.SetAt(2,bao_long);//命令长度
+	array.SetAt(3,zhilingma_B3);//指令码1
+	array.SetAt(4,zhilingma_B4);//指令码2
+	array.SetAt(5,channel_num);//通道
+	array.SetAt(6,waveType);//波形类型
+	
+	for(int i=7;i<11;i++)
+	   array.SetAt(i,ffeng[i-7]);
+	for(i=11;i<15;i++)
+	   array.SetAt(i,plv[i-11]);
+	for(i=15;i<19;i++)
+	   array.SetAt(i,pzhi[i-15]);
+	check=0;
+	for(i=0;i<19;i++)
+		check=check^array.GetAt(i);
+    array.SetAt(19,check);
+	//////////////
+    m_Serial_Volt.SetOutput(COleVariant(array));
+}

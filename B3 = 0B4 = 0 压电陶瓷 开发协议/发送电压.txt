@@ -1,0 +1,93 @@
+void CXE_DoITDlg::OnBTNSignalvolt() //发送单路电压
+{
+	// TODO: Add your control notification handler code here
+
+        UpdateData(true);
+
+		int address_ma;//地址码
+		int bao_long;  //包长
+		int zhilingma_B3;//指令码
+		int zhilingma_B4;//指令码
+		int channel_num;//通道数
+		unsigned char kk[4];//发送数据
+
+		double Send_data_temp;
+		Send_data_temp = Send_data_volt_01;//发送的数据值
+		DataAnla(Send_data_temp,kk);
+        
+        address_ma = Now_control_mcu_address;   //地址码
+		bao_long = 11;    //包长
+		zhilingma_B3 = 0; //指令码
+	    zhilingma_B4 = 0; //指令码
+		channel_num = 0;  //通道数
+
+		SendArray_V_or_M(address_ma,//地址码
+						 bao_long,  //包长
+						 zhilingma_B3,//指令码
+						 zhilingma_B4,//指令码
+						 channel_num,//通道数
+						 kk);//发送数据
+					 
+}
+
+unsigned char* CXE_DoITDlg::DataAnla(double f,unsigned char kk[4])
+{ 
+//	if(chenfeng==1)sprintf(buf,"%d",addr_save);
+	if(f<0)//f中的内容为负数
+	{
+	 f*=(-1);//将F中的内容转换为正数
+     int a=int(f);
+	  kk[0]=a/256+0x80;//将F中的内容转换为负数
+	  kk[1]=a%256;
+	  a=int((f-a)*10000);
+	  kk[2]=a/256;
+	  kk[3]=a%256;
+	}
+	else
+	{
+	  int a=int(f);
+	  kk[0]=a/256;
+	  kk[1]=a%256;
+	  a=int((f-a+0.000001)*10000);
+	  kk[2]=a/256;
+	  kk[3]=a%256;
+	}	
+	return kk;
+}
+
+void CXE_DoITDlg::SendArray_V_or_M(   int address_ma,//地址码
+									  int bao_long,  //包长
+									  int zhilingma_B3,//指令码
+									  int zhilingma_B4,//指令码
+									  int channel_num,//通道数
+									  unsigned char kk[4])//发送数据
+{
+	CByteArray array; 
+	array.RemoveAll();
+    
+	array.SetSize(bao_long);
+
+	unsigned char check;
+	array.SetAt(0,0xaa);//起始位
+
+	array.SetAt(1,address_ma); //地址吗
+	array.SetAt(2,bao_long);//命令长度
+	array.SetAt(3,zhilingma_B3);//指令码1
+	array.SetAt(4,zhilingma_B4);//指令码2
+	array.SetAt(5,channel_num);//通道
+
+	for(int i=6;i<10;i++)
+	   array.SetAt(i,kk[i-6]);
+	check=0;
+	unsigned char tmpArr[20];
+	for(i=0;i<10;i++)
+	{	
+		 check=check^array.GetAt(i);
+	     tmpArr[i] = check;
+	}
+	
+    array.SetAt(10,check);
+	//////////////
+    m_Serial_Volt.SetOutput(COleVariant(array));
+}
+
