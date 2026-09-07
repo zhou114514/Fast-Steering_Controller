@@ -84,7 +84,7 @@ SETPOINT_LIMIT = 25000  # 程序软限位：X/Y 轴设定值不超过 ±25000
 #
 # 调整方法：查看录制 CSV 中时间戳的最小间隔，将该值填入 WAVE_INTERVAL_MS。
 # 协议允许最小 1ms，但 USB 驱动通常只能稳定达到 2ms。
-WAVE_INTERVAL_MS: int = 2                              # 实际发送间隔（ms）；按硬件调整
+WAVE_INTERVAL_MS: int = 1                             # 实际发送间隔（ms）；按硬件调整
 _WAVE_SAMPLE_RATE_HZ: int = 1000 // WAVE_INTERVAL_MS  # 有效采样率（Hz）
 
 
@@ -268,6 +268,12 @@ class DianghuiController:
 
     def _send_recv_unlocked(self, frame: bytes) -> Optional[DianghuiStatus]:
         assert self._serial and self._serial.is_open, "串口未打开"
+        # 清空接收缓冲区中因只写模式积压的旧响应帧，
+        # 避免 read() 读到错位的旧数据导致校验失败进而触发虚假断连。
+        try:
+            self._serial.reset_input_buffer()
+        except Exception:
+            pass  # 极少数 USB CDC 驱动不支持，忽略
         self._serial.write(frame)
         data = self._serial.read(RX_LEN)
         return _parse_rx_frame(data)
@@ -288,6 +294,49 @@ class DianghuiController:
     # ------------------------------------------------------------------
     # 公开控制接口（物理轴坐标）
     # ------------------------------------------------------------------
+
+    def write_control_only(self, x_phys: int, y_phys: int) -> None:
+        """
+        仅写入控制帧，不等待设备响应（高速只写模式）。
+
+        去掉读等待后，单次调用耗时从 ~2ms 降至 ~0.1ms，
+        可实现真正的 1ms 发送间隔。
+        设备仍会返回状态帧，由 drain_read_buffer() 周期性批量读取。
+
+        :param x_phys: 物理X轴设定值 (int16)
+        :param y_phys: 物理Y轴设定值 (int16)
+        """
+        with self._lock:
+            self._x_phys = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(x_phys)))
+            self._y_phys = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(y_phys)))
+            assert self._serial and self._serial.is_open, "串口未打开"
+            self._serial.write(self._build_closed_loop_frame())
+
+    def drain_read_buffer(self) -> Optional[DianghuiStatus]:
+        """
+        读取并清空串口接收缓冲区，返回最新一帧有效状态（非阻塞）。
+
+        在只写模式下周期性调用：
+        - 防止 OS 接收缓冲区溢出
+        - 获取最新位置反馈用于 GUI 显示
+        返回 None 表示缓冲区中无完整有效帧。
+        """
+        if not (self._serial and self._serial.is_open):
+            return None
+        with self._lock:
+            n = self._serial.in_waiting
+            if n < RX_LEN:
+                return None
+            raw = self._serial.read(n)
+
+        # 从所有字节中扫描最后一个校验通过的状态帧
+        last_status: Optional[DianghuiStatus] = None
+        for start in range(len(raw) - RX_LEN + 1):
+            if raw[start] == 0x7E and raw[start + 1] == 0xE7:
+                status = _parse_rx_frame(bytes(raw[start:start + RX_LEN]))
+                if status is not None:
+                    last_status = status
+        return last_status
 
     def send_control(
         self,
@@ -530,6 +579,57 @@ def generate_triangle_setpoints(
 
 
 # ---------------------------------------------------------------------------
+# 方波设定值生成（巅慧专用）
+# ---------------------------------------------------------------------------
+
+def generate_square_setpoints(
+    peak_peak: float,
+    frequency: float,
+    offset: float = 0.0,
+) -> list[int]:
+    """
+    生成方波位置设定值列表（前半周期正峰值，后半周期负峰值）。
+
+    一个完整周期::
+
+        +peak_peak/2 ... +peak_peak/2 │ -peak_peak/2 ... -peak_peak/2
+        ←── 前半周期（峰值）──────────│──── 后半周期（谷值）──────────→
+
+    序列长度固定 1 秒（_WAVE_SAMPLE_RATE_HZ 点），包含 ``frequency`` 个周期。
+    第 0 帧从正峰值开始。相位使用整数运算 ``(i × freq) % n``。
+
+    :param peak_peak: 峰峰值（int16 原始码值，须 ≥ 0）
+    :param frequency: 频率（Hz），须为正整数
+    :param offset:    中心偏置，默认 0
+    :return:          有符号整数列表（长度 = _WAVE_SAMPLE_RATE_HZ），
+                      每个元素为 offset ± peak_peak/2（已夹限）
+    :raises ValueError: 频率为非正整数
+    """
+    if frequency <= 0:
+        raise ValueError(f"频率必须为正数，收到: {frequency}")
+    if peak_peak < 0:
+        raise ValueError(f"峰峰值不能为负，收到: {peak_peak}")
+
+    freq_int = int(round(frequency))
+    if not math.isclose(frequency, freq_int, abs_tol=1e-9):
+        raise ValueError(
+            f"频率须为整数 Hz（以便与 {WAVE_INTERVAL_MS}ms 采样对齐），收到: {frequency}"
+        )
+
+    n         = _WAVE_SAMPLE_RATE_HZ          # 固定 1 秒
+    amplitude = peak_peak / 2.0
+    half_n    = n // 2                         # 相位计数半周期阈值
+
+    pos_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(offset + amplitude)))
+    neg_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(offset - amplitude)))
+
+    return [
+        pos_val if (i * freq_int) % n < half_n else neg_val
+        for i in range(n)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 软件正弦波管理器（巅慧专用）
 # ---------------------------------------------------------------------------
 
@@ -555,6 +655,20 @@ class DianghuiWaveManager:
 
     _INTERVAL: float = WAVE_INTERVAL_MS / 1000.0  # 目标发送间隔（秒），与采样率同步
 
+    # ── 只写模式（Write-Only）──────────────────────────────────────────────
+    # 发送时不等待设备响应，可将实际间隔从 ~2ms 降至 ~1ms。
+    # 若需要 1ms 控制，同时将顶部 WAVE_INTERVAL_MS 改为 1。
+    WRITE_ONLY_MODE: bool = True   # True=只写（快速）；False=发送+等待响应（~2ms）
+
+    # 是否在波形发送期间解析状态帧并更新状态显示。
+    # True（默认）：每 _STATUS_READ_INTERVAL 秒 drain + 解析，状态灯刷新。
+    # False：每 _DISCARD_INTERVAL 秒仅丢弃缓冲区（不解析），状态灯停止刷新，
+    #        发送线程完全专注写入；注意：即使 False 也必须定期丢弃接收缓冲区，
+    #        否则设备响应以 ~5KB/s（@2ms）积压 0.8-1.6s 后缓冲溢出、USB 通信中断、波形停止。
+    DRAIN_DURING_WAVE:    bool  = True
+    _STATUS_READ_INTERVAL: float = 0.5   # DRAIN_DURING_WAVE=True  时的解析 + 丢弃周期（秒）
+    _DISCARD_INTERVAL:    float = 0.05   # DRAIN_DURING_WAVE=False 时的仅丢弃周期（秒）
+
     def __init__(self, controller: DianghuiController):
         self._ctrl = controller
         self._lock = threading.Lock()
@@ -569,6 +683,8 @@ class DianghuiWaveManager:
 
         self._thread:     Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
+
+        self._last_status_read_t: float = 0.0  # 只写模式：上次读取状态的时间
 
         # ── 数据记录 ───────────────────────────────────────────────────────
         self._rec_lock:   threading.Lock = threading.Lock()
@@ -612,6 +728,25 @@ class DianghuiWaveManager:
         pts = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints]
         with self._lock:
             self._pts_y = pts
+            self._idx_y = 0
+        self._ensure_running()
+
+    def start_wave_xy(self, setpoints_x: list, setpoints_y: list):
+        """
+        原子性同时启动双轴波形，保证相位完全同步（零相位差）。
+
+        与分别调用 start_wave_x / start_wave_y 相比，此方法在同一把锁内
+        同时将两轴索引归零，消除顺序调用时线程先行推进 X 轴导致的相位偏差。
+
+        例：80Hz 下两轴各差 1 帧（2ms）= 57.6° 相位差，会产生明显椭圆；
+        使用此方法保证 0° 相位差，呈现理想的斜线扫描。
+        """
+        pts_x = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints_x]
+        pts_y = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints_y]
+        with self._lock:               # 单次锁内同时归零，线程无法插入
+            self._pts_x = pts_x
+            self._idx_x = 0
+            self._pts_y = pts_y
             self._idx_y = 0
         self._ensure_running()
 
@@ -761,11 +896,42 @@ class DianghuiWaveManager:
                     y_val = self._static_y
 
             try:
-                status = self._ctrl.send_control(x_phys=x_val, y_phys=y_val)
-                if status is not None:
-                    with self._lock:
-                        self._last_status = status
-                    self._push_record(status)   # 若记录已激活，保存本帧反馈
+                if self.WRITE_ONLY_MODE:
+                    # ── 只写路径（~0.1ms/帧，可达 1ms 控制间隔）────────────
+                    self._ctrl.write_control_only(x_phys=x_val, y_phys=y_val)
+
+                    # 定期批量读取接收缓冲区（防溢出 + 刷新状态显示）
+                    # DRAIN_DURING_WAVE=False 时跳过，追求最纯粹的发送稳定性
+                    now = perf_counter()
+                    if self.DRAIN_DURING_WAVE:
+                        # 解析模式：drain + 解析状态帧，刷新状态显示
+                        if now - self._last_status_read_t >= self._STATUS_READ_INTERVAL:
+                            self._last_status_read_t = now
+                            status = self._ctrl.drain_read_buffer()
+                            if status is not None:
+                                with self._lock:
+                                    self._last_status = status
+                                self._push_record(status)
+                    else:
+                        # 纯丢弃模式：不解析，仅防止 USB 接收缓冲区溢出导致通信中断
+                        # （设备每帧回 10 字节，@2ms=5KB/s，不丢弃则约 1s 内溢出）
+                        if now - self._last_status_read_t >= self._DISCARD_INTERVAL:
+                            self._last_status_read_t = now
+                            try:
+                                with self._ctrl._lock:
+                                    if (self._ctrl._serial
+                                            and self._ctrl._serial.is_open
+                                            and self._ctrl._serial.in_waiting > 0):
+                                        self._ctrl._serial.reset_input_buffer()
+                            except Exception:
+                                pass
+                else:
+                    # ── 完整收发路径（~2ms/帧，含读等待）────────────────────
+                    status = self._ctrl.send_control(x_phys=x_val, y_phys=y_val)
+                    if status is not None:
+                        with self._lock:
+                            self._last_status = status
+                        self._push_record(status)
             except Exception:
                 break  # 串口异常，退出；主线程轮询会发现断连
 
@@ -773,6 +939,15 @@ class DianghuiWaveManager:
             remaining = next_t - perf_counter()
             if remaining > 0:
                 sleep(remaining)
+
+        # ── 线程退出前清空接收缓冲区 ──────────────────────────────────────
+        # 波形停止后缓冲区可能残留 ≤100ms 的旧响应帧；
+        # 若不清空，随后的 send_readback() 会读到错位旧数据导致虚假断连。
+        if self.WRITE_ONLY_MODE:
+            try:
+                self._ctrl.drain_read_buffer()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,8 @@
 
 支持两种协议（通过 config.ini [Protocol] type 字段切换）：
   xinmingtian — 芯明天 FSC，波形由硬件生成，支持数字/模拟切换
-  dianghui    — 巅慧，由上位机软件生成正弦序列以 1ms 间隔下发；
+  dianghui    — 巅慧，由上位机软件生成正弦/模拟位置序列，
+                按 WAVE_INTERVAL_MS（当前 2ms，USB 一发一收下限）下发；
                 具有轴交换透明处理、8 灯状态面板、模拟位置文件控制
 """
 
@@ -46,6 +47,7 @@ from dianghui_protocol import (
     DianghuiStatus,
     DianghuiWaveManager,
     generate_sine_setpoints,
+    generate_square_setpoints,
     generate_triangle_setpoints,
 )
 from fsc_protocol import FSCController, FSCError, WaveType
@@ -70,9 +72,11 @@ WAVE_TYPES = {
 # 巅慧软件生成波形类型（字符串标识，与 WaveType 枚举独立）
 DH_WAVE_SINE     = "sine"
 DH_WAVE_TRIANGLE = "triangle"
+DH_WAVE_SQUARE   = "square"
 DH_WAVE_TYPES = {
     "正弦波":  DH_WAVE_SINE,
     "三角波":  DH_WAVE_TRIANGLE,
+    "方波":    DH_WAVE_SQUARE,
 }
 
 COMMON_FREQS = [20, 80, 120, 140, 160]
@@ -451,9 +455,9 @@ class MainWindow(QMainWindow):
         # --- 巅慧状态 ---
         self._dh: Optional[DianghuiController]         = None
         self._dh_wave_mgr: Optional[DianghuiWaveManager] = None
-        self._analog_pos_file:    Optional[str]        = None
-        self._analog_pos_data:    Optional[list[int]]  = None
-        self._analog_pos_channel: int                  = 0
+        self._analog_pos_file: Optional[str]       = None
+        self._analog_pos_x:    Optional[list[int]] = None
+        self._analog_pos_y:    Optional[list[int]] = None
 
         # --- 公共状态 ---
         self._displacement      = [0.0, 0.0]
@@ -638,7 +642,9 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(bar)
         h.setSpacing(8)
 
-        h.addWidget(QLabel("位置文件:"))
+        h.addWidget(QLabel(
+            f"位置文件 (X,Y 两列, 按{DH_WAVE_INTERVAL_MS}ms下发):"
+        ))
         self._analog_file_lbl = QLabel("未选择")
         self._analog_file_lbl.setStyleSheet("color: #888888;")
         h.addWidget(self._analog_file_lbl, 1)
@@ -715,8 +721,9 @@ class MainWindow(QMainWindow):
 
     # --- 波形控制区 ---
     def _build_wave_area(self) -> QWidget:
-        title = "波形控制（软件正弦，1ms 间隔）" if self._protocol == PROTOCOL_DIANHUI \
-                else "波形控制（数字模式）"
+        title = (f"波形控制（软件正弦，{DH_WAVE_INTERVAL_MS}ms 间隔）"
+                 if self._protocol == PROTOCOL_DIANHUI
+                 else "波形控制（数字模式）")
         group = QGroupBox(title)
         v = QVBoxLayout(group)
         v.setSpacing(6)
@@ -879,7 +886,8 @@ class MainWindow(QMainWindow):
         if self._loop_btn:
             self._loop_btn.setEnabled(False)
         if self._analog_play_btn:
-            self._analog_play_btn.setEnabled(False if not self._analog_pos_data else True)
+            has_data = bool(self._analog_pos_x and self._analog_pos_y)
+            self._analog_play_btn.setEnabled(has_data)
         if self._analog_stop_btn:
             self._analog_stop_btn.setEnabled(False)
         # 重置同步按钮状态
@@ -1057,8 +1065,38 @@ class MainWindow(QMainWindow):
     # 巅慧: 模拟位置文件控制
     # ================================================================
 
+    @staticmethod
+    def _clamp_int16(value: float) -> int:
+        return max(-32768, min(32767, round(value)))
+
+    @staticmethod
+    def _parse_comment_interval_ms(comment: str) -> Optional[int]:
+        """仅当注释内容以 sample_interval_ms 开头时解析间隔。"""
+        body = comment.lstrip("#").strip()
+        lowered = body.lower().replace(" ", "").replace("　", "")
+        token = "sample_interval_ms"
+        if not lowered.startswith(token):
+            return None
+        rest = lowered[len(token):].lstrip(":=：")
+        digits: list[str] = []
+        for ch in rest:
+            if ch.isdigit():
+                digits.append(ch)
+            elif digits:
+                break
+        if not digits:
+            return None
+        val = int("".join(digits))
+        return val if val > 0 else None
+
     def _on_load_analog_pos(self):
-        """加载模拟位置 CSV 文件（每行一个数值）并解析。"""
+        """
+        加载模拟位置 CSV（两列 X,Y）。
+
+        文件默认按 1ms 采样编写（1 秒 = 1000 行）；加载后按 WAVE_INTERVAL_MS
+        （当前 USB 一发一收约 2ms）抽点，保证轨迹时长不变。
+        若注释中写有 ``sample_interval_ms: N``，则按该间隔抽点。
+        """
         path, _ = QFileDialog.getOpenFileName(
             self, "加载模拟位置文件",
             os.path.join(os.path.dirname(__file__), "analog_positions"),
@@ -1067,22 +1105,62 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            positions = []
-            channel   = 0
-            with open(path, newline="", encoding="utf-8") as f:
-                for row in csv.reader(f):
-                    for cell in row:
-                        cell = cell.strip()
-                        if cell and not cell.startswith("#"):
-                            positions.append(
-                                max(-32768, min(32767, round(float(cell))))
-                            )
-            if not positions:
+            pos_x: list[int] = []
+            pos_y: list[int] = []
+            header_skipped = False
+            file_interval_ms = 1
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for line_no, row in enumerate(csv.reader(f), start=1):
+                    cells = [c.strip() for c in row]
+                    if not cells or all(not c for c in cells):
+                        continue
+                    if cells[0].startswith("#"):
+                        parsed = self._parse_comment_interval_ms(",".join(cells))
+                        if parsed is not None:
+                            file_interval_ms = parsed
+                        continue
+                    if len(cells) < 2:
+                        raise ValueError(
+                            f"第 {line_no} 行只有 {len(cells)} 列，需要两列（X,Y）"
+                        )
+                    try:
+                        x_val = self._clamp_int16(float(cells[0]))
+                        y_val = self._clamp_int16(float(cells[1]))
+                    except ValueError:
+                        if not pos_x and not header_skipped:
+                            header_skipped = True
+                            continue
+                        raise ValueError(
+                            f"第 {line_no} 行无法解析为数值: {cells[0]!r}, {cells[1]!r}"
+                        )
+                    pos_x.append(x_val)
+                    pos_y.append(y_val)
+            if not pos_x:
                 raise ValueError("位置列表为空")
-            self._analog_pos_data    = positions
-            self._analog_pos_channel = channel
-            self._analog_pos_file    = path
-            lbl = f"通道{channel}: {os.path.basename(path)} ({len(positions)} 点)"
+
+            send_interval = DH_WAVE_INTERVAL_MS
+            if send_interval % file_interval_ms != 0:
+                raise ValueError(
+                    f"文件采样间隔 {file_interval_ms}ms "
+                    f"无法整除发送间隔 {send_interval}ms"
+                )
+            step = send_interval // file_interval_ms
+            n_src = len(pos_x)
+            if step > 1:
+                pos_x = pos_x[::step]
+                pos_y = pos_y[::step]
+            if not pos_x:
+                raise ValueError("抽点后位置列表为空")
+
+            self._analog_pos_x    = pos_x
+            self._analog_pos_y    = pos_y
+            self._analog_pos_file = path
+            duration_s = len(pos_x) * send_interval / 1000.0
+            lbl = (
+                f"{os.path.basename(path)}  "
+                f"(原始 {n_src} 点/{file_interval_ms}ms → "
+                f"下发 {len(pos_x)} 点/{send_interval}ms, {duration_s:.2f}s)"
+            )
             if self._analog_file_lbl:
                 self._analog_file_lbl.setText(lbl)
                 self._analog_file_lbl.setStyleSheet("color: #00cc44;")
@@ -1095,27 +1173,24 @@ class MainWindow(QMainWindow):
         if not (self._dh and self._dh_wave_mgr):
             self._show_error("串口未连接")
             return
-        if not self._analog_pos_data:
+        if not (self._analog_pos_x and self._analog_pos_y):
             self._show_error("请先加载位置文件")
             return
-        ch = self._analog_pos_channel
-        if ch == 0:
-            self._dh_wave_mgr.start_wave_x(self._analog_pos_data)
-        else:
-            self._dh_wave_mgr.start_wave_y(self._analog_pos_data)
+        self._dh_wave_mgr.start_wave_x(self._analog_pos_x)
+        self._dh_wave_mgr.start_wave_y(self._analog_pos_y)
         if self._analog_stop_btn:
             self._analog_stop_btn.setEnabled(True)
+        n = len(self._analog_pos_x)
+        duration_s = n * DH_WAVE_INTERVAL_MS / 1000.0
         self._status_bar.showMessage(
-            f"模拟位置发送中: 通道 {ch}，{len(self._analog_pos_data)} 点循环"
+            f"模拟位置发送中: X/Y 各 {n} 点，间隔 {DH_WAVE_INTERVAL_MS}ms，"
+            f"时长 {duration_s:.2f}s 循环"
         )
 
     def _on_stop_analog_pos(self):
         if self._dh_wave_mgr:
-            ch = self._analog_pos_channel
-            if ch == 0:
-                self._dh_wave_mgr.stop_wave_x(static_value=0)
-            else:
-                self._dh_wave_mgr.stop_wave_y(static_value=0)
+            self._dh_wave_mgr.stop_wave_x(static_value=0)
+            self._dh_wave_mgr.stop_wave_y(static_value=0)
         if self._analog_stop_btn:
             self._analog_stop_btn.setEnabled(False)
         self._status_bar.showMessage("模拟位置已停止")
@@ -1250,7 +1325,7 @@ class MainWindow(QMainWindow):
                         self._dh_wave_mgr.update_static_x(ival)
                     else:
                         self._dh_wave_mgr.update_static_y(ival)
-                # 直接发一帧立即到达目标（若波形管理器在运行会在1ms内接管）
+                # 直接发一帧立即到达目标（若波形管理器在运行会在下一发送周期接管）
                 if channel == 0:
                     self._dh.send_control(x_phys=ival, y_phys=other_ival)
                 else:
@@ -1281,6 +1356,9 @@ class MainWindow(QMainWindow):
                 if wave_type == DH_WAVE_TRIANGLE:
                     pts      = generate_triangle_setpoints(peak_peak, frequency, offset)
                     type_str = "三角波"
+                elif wave_type == DH_WAVE_SQUARE:
+                    pts      = generate_square_setpoints(peak_peak, frequency, offset)
+                    type_str = "方波"
                 else:
                     pts      = generate_sine_setpoints(peak_peak, frequency, offset)
                     type_str = "正弦波"
@@ -1472,30 +1550,48 @@ class MainWindow(QMainWindow):
             self._sync_stop_all()
 
     def _sync_start_all(self):
-        """同时启动两个通道的正弦波形。"""
+        """
+        原子性同步启动双轴波形（零相位差）。
+
+        先生成双轴所有设定值点列，再通过 start_wave_xy() 在单次锁内同时归零两轴索引，
+        彻底消除顺序调用 start_wave_x/y 时因线程先行推进导致的相位偏差。
+        """
         if not (self._dh and self._dh_wave_mgr):
             self._show_error("串口未连接")
             return
-        success = True
-        for ch in range(2):
-            w = self._wave_widgets[ch]
-            try:
-                self._send_wave(
-                    channel   = ch,
-                    wave_type = w.get_wave_type(),
-                    peak_peak = w.get_peak_peak(),
-                    frequency = w.get_frequency(),
-                    offset    = w.get_offset(),
-                )
-            except Exception as exc:
-                self._show_error(f"通道 {ch} 启动波形失败: {exc}")
-                success = False
-        if success:
+        try:
+            # ── 第一步：在线程启动前提前生成双轴数据 ───────────────────────
+            pts_per_ch: dict[int, list] = {}
+            for ch in range(2):
+                w = self._wave_widgets[ch]
+                wave_type = w.get_wave_type()
+                peak_peak = w.get_peak_peak()
+                frequency = w.get_frequency()
+                offset    = w.get_offset()
+                if wave_type == DH_WAVE_TRIANGLE:
+                    pts = generate_triangle_setpoints(peak_peak, frequency, offset)
+                elif wave_type == DH_WAVE_SQUARE:
+                    pts = generate_square_setpoints(peak_peak, frequency, offset)
+                else:
+                    pts = generate_sine_setpoints(peak_peak, frequency, offset)
+                pts_per_ch[ch] = pts
+
+            # ── 第二步：原子性同步启动，X/Y 索引同时归零 ─────────────────
+            self._dh_wave_mgr.start_wave_xy(pts_per_ch[0], pts_per_ch[1])
+
             self._sync_wave_active = True
             if self._sync_wave_btn:
                 self._sync_wave_btn.setText("■   双轴同步停止")
                 self._sync_wave_btn.setStyleSheet(self._sync_btn_style(active=True))
-            self._status_bar.showMessage("双轴波形已同步启动")
+            w0 = self._wave_widgets[0]
+            self._status_bar.showMessage(
+                f"双轴同步启动: {w0.get_frequency():.0f}Hz  "
+                f"各 {len(pts_per_ch[0])} 点  相位同步"
+            )
+        except ValueError as exc:
+            self._show_error(f"参数错误: {exc}")
+        except Exception as exc:
+            self._show_error(f"启动波形失败: {exc}")
 
     def _sync_stop_all(self):
         """同时停止两个通道的波形，各自返回位移面板的目标位置。"""
@@ -1581,6 +1677,9 @@ class MainWindow(QMainWindow):
                 if wave_str == "triangle":
                     pts      = generate_triangle_setpoints(peak_peak, frequency, offset)
                     type_str = "三角波"
+                elif wave_str == "square":
+                    pts      = generate_square_setpoints(peak_peak, frequency, offset)
+                    type_str = "方波"
                 else:
                     pts      = generate_sine_setpoints(peak_peak, frequency, offset)
                     type_str = "正弦波"
