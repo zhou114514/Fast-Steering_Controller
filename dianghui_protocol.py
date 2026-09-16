@@ -7,12 +7,17 @@
 指令帧格式 (13 bytes):
   byte  0-1 : 帧头 0x7E 0xE7
   byte  2   : 指令码
-               0x00 = 控制 (Control)
-               0x01 = 回读 (Readback)
-               0x04 = 复位 (Reset)
-               0x05 = 自检 (Self-check)
-  byte  3-4 : 协议 X 轴设定值 (int16, big-endian)  [注: 协议X ↔ 物理Y]
-  byte  5-6 : 协议 Y 轴设定值 (int16, big-endian)  [注: 协议Y ↔ 物理X]
+               0x00 = 待命
+               0x01 = 闭环
+               0x02 = 自检
+               0x03 = 开环
+               0x04 = 快反镜协议X轴正弦扫描
+               0x05 = 快反镜协议Y轴正弦扫描
+               0x06 = 快反镜XY轴同时正弦扫描
+  byte  3-4 : 闭环/开环/待命/自检: 协议 X 轴设定值 (int16, BE)  [协议X ↔ 物理Y]
+              正弦扫描 (0x04/05/06): 正弦频率 (int16, BE)，1 Hz/LSB，范围 0~5000
+  byte  5-6 : 闭环/开环/待命/自检: 协议 Y 轴设定值 (int16, BE)  [协议Y ↔ 物理X]
+              正弦扫描 (0x04/05/06): 正弦幅值 (int16, BE)，峰值（非峰峰值）
   byte  7-8 : 协议 X 轴限位值 (uint16, big-endian)
   byte  9-10: 协议 Y 轴限位值 (uint16, big-endian)
   byte 11   : 保留 0x00
@@ -40,18 +45,16 @@
   状态帧: 待校验 = byte[2:9] （7字节）
 
 轴映射说明（透明，所有公开接口使用物理轴坐标）:
-  物理X轴 (channel 0) ↔ 协议Y字段
-  物理Y轴 (channel 1) ↔ 协议X字段
+  物理X轴 (channel 0) ↔ 协议Y字段 / 协议正弦指令 0x05
+  物理Y轴 (channel 1) ↔ 协议X字段 / 协议正弦指令 0x04
   原因: 设备实际接线与期望运动轴相反，协议层统一处理交换以对外透明。
 """
 
 from __future__ import annotations
 
-import math
 import struct
 import threading
 from dataclasses import dataclass
-from math import gcd
 from time import perf_counter, sleep
 from typing import Optional
 
@@ -64,28 +67,33 @@ import serial
 
 FRAME_HEADER   = bytes([0x7E, 0xE7])
 
-CMD_STANDBY    = 0x00  # 待机：自由态，X/Y 轴均不使能
+CMD_STANDBY     = 0x00  # 待命：自由态，X/Y 轴均不使能
 CMD_CLOSED_LOOP = 0x01  # 闭环：X/Y 轴使能，闭环位置控制（发送位置 / 读取状态）
-CMD_OPEN_LOOP   = 0x04  # 开环：轴不使能
-CMD_SELFCHECK   = 0x05  # 自检
+CMD_SELFCHECK   = 0x02  # 自检
+CMD_OPEN_LOOP   = 0x03  # 开环：轴不使能
+CMD_SINE_X      = 0x04  # 协议X轴正弦扫描 → 物理Y
+CMD_SINE_Y      = 0x05  # 协议Y轴正弦扫描 → 物理X
+CMD_SINE_XY     = 0x06  # XY轴同时正弦扫描
+
+# 公开接口使用物理轴：'x' / 'y' / 'xy'
+SINE_CMD_PHYS = {
+    "x":  CMD_SINE_Y,   # 物理X ↔ 协议Y
+    "y":  CMD_SINE_X,   # 物理Y ↔ 协议X
+    "xy": CMD_SINE_XY,
+}
 
 TX_LEN = 13   # 指令帧总长度（bytes）
 RX_LEN = 10   # 状态帧总长度（bytes）
 
 DEFAULT_LIMIT  = 5000   # 初始化时默认限位值
 SETPOINT_LIMIT = 25000  # 程序软限位：X/Y 轴设定值不超过 ±25000
+SINE_FREQ_MAX  = 5000   # 正弦频率上限（Hz），1 Hz/LSB
 
 # ---------------------------------------------------------------------------
-# 实际波形发送间隔配置
+# 发送间隔配置（模拟位置序列 / 正弦保活）
 # ---------------------------------------------------------------------------
-# USB CDC 串口驱动的单次收发往返延迟通常约 2ms（取决于 USB 轮询间隔和驱动缓冲）。
-# perf_counter 补偿算法在 send_control 本身耗时 > 目标间隔时失效，
-# 因此必须把目标间隔设为实际可达值，否则频率会系统性偏低。
-#
-# 调整方法：查看录制 CSV 中时间戳的最小间隔，将该值填入 WAVE_INTERVAL_MS。
-# 协议允许最小 1ms，但 USB 驱动通常只能稳定达到 2ms。
-WAVE_INTERVAL_MS: int = 1                             # 实际发送间隔（ms）；按硬件调整
-_WAVE_SAMPLE_RATE_HZ: int = 1000 // WAVE_INTERVAL_MS  # 有效采样率（Hz）
+# 只写模式下目标间隔 1ms（1 kHz）。设备每帧都会回状态，须定时 drain 防溢出。
+WAVE_INTERVAL_MS: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +132,12 @@ class DianghuiError(Exception):
 # 底层帧工具（内部使用，参数均为协议坐标）
 # ---------------------------------------------------------------------------
 
+def _spin_until(deadline: float) -> None:
+    """忙等到 deadline。Windows 的 sleep 分辨率约 1ms，无法用于 0.2ms 节拍。"""
+    while perf_counter() < deadline:
+        pass
+
+
 def _calc_checksum(data: bytes | list[int]) -> int:
     """计算校验位: (~sum(data)) & 0xFF"""
     return (~sum(data)) & 0xFF
@@ -152,6 +166,31 @@ def _build_tx_frame(
 
     # body: cmd(B) + x_set(h) + y_set(h) + x_lim(H) + y_lim(H) + reserved(B)
     body = struct.pack('>BhhHHB', cmd, proto_x_set, proto_y_set,
+                       proto_x_lim, proto_y_lim, 0x00)
+    checksum = _calc_checksum(body)
+    return FRAME_HEADER + body + bytes([checksum])
+
+
+def _build_sine_tx_frame(
+    cmd: int,
+    frequency: int,
+    amplitude: int,
+    proto_x_lim: int,
+    proto_y_lim: int,
+) -> bytes:
+    """
+    构造正弦控制帧（频率/幅值不走轴交换；限位仍为协议坐标）。
+
+    :param cmd:       0x04 / 0x05 / 0x06
+    :param frequency: 正弦频率（Hz），1 Hz/LSB，范围 0~5000
+    :param amplitude: 正弦峰值（与位置设定值同单位，非峰峰值）
+    """
+    frequency = max(0, min(SINE_FREQ_MAX, int(frequency)))
+    amplitude = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(amplitude)))
+    proto_x_lim = max(0, min(65535, int(proto_x_lim)))
+    proto_y_lim = max(0, min(65535, int(proto_y_lim)))
+
+    body = struct.pack('>BhhHHB', cmd, frequency, amplitude,
                        proto_x_lim, proto_y_lim, 0x00)
     checksum = _calc_checksum(body)
     return FRAME_HEADER + body + bytes([checksum])
@@ -291,6 +330,16 @@ class DianghuiController:
             proto_y_lim = self._x_lim,
         )
 
+    def _build_sine_frame(self, cmd: int, frequency: int, amplitude: int) -> bytes:
+        """构造正弦控制帧。调用方须持有锁。限位做轴交换。"""
+        return _build_sine_tx_frame(
+            cmd         = cmd,
+            frequency   = frequency,
+            amplitude   = amplitude,
+            proto_x_lim = self._y_lim,
+            proto_y_lim = self._x_lim,
+        )
+
     # ------------------------------------------------------------------
     # 公开控制接口（物理轴坐标）
     # ------------------------------------------------------------------
@@ -311,6 +360,38 @@ class DianghuiController:
             self._y_phys = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(y_phys)))
             assert self._serial and self._serial.is_open, "串口未打开"
             self._serial.write(self._build_closed_loop_frame())
+
+    def write_control_paced(
+        self,
+        pairs: list[tuple[int, int]],
+        slot_s: float,
+        t0: float,
+    ) -> None:
+        """
+        在 1ms 窗口内按均匀节拍逐帧发送（默认 5 帧 → 每 0.2ms 一帧）。
+
+        第 i 帧目标时刻为 ``t0 + i * slot_s``。若已迟到则立即发送，不额外等待。
+        使用忙等而不是 sleep：Windows 无法稳定 sleep 200µs。
+
+        注意：USB-CDC 适配器仍可能把若干 URB 挤进同一个 1ms USB 帧；
+        本方法保证的是主机侧提交 write 的时刻均匀。
+        """
+        if not pairs:
+            return
+        now = perf_counter()
+        # 若本毫秒起点已经错过一整格，重定 t0，避免 5 帧挤成一坨发出去
+        if now > t0 + slot_s:
+            t0 = now
+        for i, (x_phys, y_phys) in enumerate(pairs):
+            target = t0 + i * slot_s
+            if perf_counter() < target:
+                _spin_until(target)
+            self.write_control_only(x_phys, y_phys)
+
+    def write_control_burst(self, pairs: list[tuple[int, int]]) -> None:
+        """兼容旧接口：改为均匀节拍发送（等价 write_control_paced）。"""
+        slot_s = (WAVE_INTERVAL_MS / 1000.0) / max(1, len(pairs))
+        self.write_control_paced(pairs, slot_s=slot_s, t0=perf_counter())
 
     def drain_read_buffer(self) -> Optional[DianghuiStatus]:
         """
@@ -366,7 +447,7 @@ class DianghuiController:
     def send_readback(self) -> Optional[DianghuiStatus]:
         """
         以闭环指令读取当前状态（维持闭环、不改变设定值）。
-        0x01 既是闭环控制帧也是唯一能获取状态帧的方式。
+        空闲时用 0x01 取状态；硬件正弦运行期间由保活线程 drain，勿在此时调用本方法。
         """
         with self._lock:
             return self._send_recv_unlocked(self._build_closed_loop_frame())
@@ -401,7 +482,7 @@ class DianghuiController:
             return self._send_recv_unlocked(frame)
 
     def send_open_loop(self) -> Optional[DianghuiStatus]:
-        """切换为开环模式（0x04）：轴不使能。"""
+        """切换为开环模式（0x03）：轴不使能。"""
         with self._lock:
             frame = _build_tx_frame(
                 cmd         = CMD_OPEN_LOOP,
@@ -411,6 +492,45 @@ class DianghuiController:
                 proto_y_lim = DEFAULT_LIMIT,
             )
             return self._send_recv_unlocked(frame)
+
+    def write_sine_only(
+        self,
+        mode: str,
+        frequency: int,
+        amplitude: int,
+    ) -> None:
+        """
+        仅写入正弦控制帧，不等待设备响应（高速只写）。
+
+        :param mode:      物理轴 'x' / 'y' / 'xy'
+        :param frequency: 频率 Hz（1 Hz/LSB，0~5000）
+        :param amplitude: 峰值（与位置设定值同单位；峰峰值需由调用方 /2）
+        """
+        cmd = SINE_CMD_PHYS.get(mode)
+        if cmd is None:
+            raise ValueError(f"正弦模式须为 'x'/'y'/'xy'，收到: {mode}")
+        with self._lock:
+            assert self._serial and self._serial.is_open, "串口未打开"
+            self._serial.write(self._build_sine_frame(cmd, frequency, amplitude))
+
+    def send_sine(
+        self,
+        mode: str,
+        frequency: int,
+        amplitude: int,
+    ) -> Optional[DianghuiStatus]:
+        """
+        发送正弦扫描指令并等待状态帧。
+
+        正弦指令不支持偏置；幅值为峰值。停止正弦请改发闭环位置指令。
+        """
+        cmd = SINE_CMD_PHYS.get(mode)
+        if cmd is None:
+            raise ValueError(f"正弦模式须为 'x'/'y'/'xy'，收到: {mode}")
+        with self._lock:
+            return self._send_recv_unlocked(
+                self._build_sine_frame(cmd, frequency, amplitude)
+            )
 
     # ------------------------------------------------------------------
     # 状态查询属性
@@ -428,246 +548,24 @@ class DianghuiController:
 
 
 # ---------------------------------------------------------------------------
-# 正弦设定值生成（巅慧专用，1ms 采样间隔，输出有符号整型）
-# ---------------------------------------------------------------------------
-
-def generate_sine_setpoints(
-    peak_peak: float,
-    frequency: float,
-    offset: float = 0.0,
-) -> list[int]:
-    """
-    生成巅慧协议所需的正弦位置设定值列表（1ms 采样，输出有符号整数）。
-
-    算法设计原则
-    ------------
-    1. **峰峰值精确命中**：使用余弦（cosine）而非正弦，第 0 帧恰好落在正峰值
-       ``offset + peak_peak/2``，保证极值被完整表达，无采样截断误差。
-
-    2. **序列长度确定**：
-
-       - 若单周期 ``T = 1000 / frequency`` 恰好为整数 ms
-         → 序列长度 = T（1 个完整周期）
-
-       - 若 T 不是整数 ms（如 80Hz→12.5ms, 120Hz→8.333ms）
-         → 序列长度 = 1000（整整 1 秒），覆盖 ``frequency`` 个完整周期，
-         循环点处连续无跳变
-
-    3. **循环点连续**：余弦在 ``t = N × T`` 处值恒为 ``amplitude``（与 t=0 相同），
-       loop 衔接点无阶跃。
-
-    各常用频率的序列长度（以 WAVE_INTERVAL_MS=2ms, 采样率500Hz 为例）::
-
-        20  Hz → T=50ms（整数）→   25 点（1 个周期，25帧×2ms）
-        80  Hz → T=12.5ms       →  500 点（80 个周期，500帧×2ms=1s）
-        120 Hz → T=8.333ms      →  500 点（120 个周期）
-        140 Hz → T=7.143ms      →  500 点（140 个周期）
-        160 Hz → T=6.25ms       →  500 点（160 个周期）
-
-    注：WAVE_INTERVAL_MS 修改后，序列长度自动跟随调整。
-
-    :param peak_peak: 峰峰值（int16 原始码值，须 ≥ 0；建议 ≤ 2 × SETPOINT_LIMIT）
-    :param frequency: 正弦频率（Hz），须为正整数
-    :param offset:    中心偏置（int16 码值），默认 0
-    :return:          有符号整数列表，已夹限到 ±SETPOINT_LIMIT；
-                      第 0 个元素恰好等于 ``clamp(round(offset + peak_peak/2))``
-    :raises ValueError: 频率为非正整数
-    """
-    if frequency <= 0:
-        raise ValueError(f"频率必须为正数，收到: {frequency}")
-    if peak_peak < 0:
-        raise ValueError(f"峰峰值不能为负，收到: {peak_peak}")
-
-    freq_int = int(round(frequency))
-    if not math.isclose(frequency, freq_int, abs_tol=1e-9):
-        raise ValueError(
-            f"频率须为整数 Hz（以便与 1ms 采样对齐），收到: {frequency}"
-        )
-
-    # ── 序列长度 ──────────────────────────────────────────────────────────
-    # 若单周期恰好为整数 ms → 一个周期即可完美循环
-    # 否则 → 用 1000 点（1 秒）覆盖 freq 个完整周期
-    T_ms = _WAVE_SAMPLE_RATE_HZ / freq_int          # 单周期 ms（可能非整数）
-    T_ms_rounded = round(T_ms)
-    if math.isclose(T_ms, T_ms_rounded, abs_tol=1e-9):
-        n_points = T_ms_rounded                      # 整数 ms → 最短闭合长度
-    else:
-        n_points = _WAVE_SAMPLE_RATE_HZ              # 非整数 ms → 整 1 秒
-
-    # ── 采样 ──────────────────────────────────────────────────────────────
-    # 使用余弦：i=0 时 cos(0)=1 → 第 0 帧精确等于正峰值
-    amplitude = peak_peak / 2.0
-    dt = 1.0 / _WAVE_SAMPLE_RATE_HZ                 # 0.001 s
-    return [
-        max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(
-            offset + amplitude * math.cos(2.0 * math.pi * freq_int * i * dt)
-        )))
-        for i in range(n_points)
-    ]
-
-
-# ---------------------------------------------------------------------------
-# 三角波设定值生成（巅慧专用，恒速线性往复）
-# ---------------------------------------------------------------------------
-
-def generate_triangle_setpoints(
-    peak_peak: float,
-    frequency: float,
-    offset: float = 0.0,
-) -> list[int]:
-    """
-    生成三角波位置设定值列表（恒速线性往复，有符号整数输出）。
-
-    **一个完整周期的波形**（从中心 offset 出发）::
-
-        0 ──上升──► +peak_peak/2 ──下降──► 0 ──下降──► -peak_peak/2 ──上升──► 0
-
-    **序列长度**：固定 1 秒（_WAVE_SAMPLE_RATE_HZ 点），包含恰好
-    ``frequency`` 个完整周期，循环发送即可实现持续往复运动。
-
-    **相位计算**：使用整数运算 ``raw = (i × freq) % sample_rate``
-    避免浮点累积误差，每条周期的边界精确对齐到 0（中心位置）。
-
-    与 generate_sine_setpoints 的对比::
-
-        正弦波：变速，端点速度=0（平滑）；中点速度最大
-        三角波：匀速线性扫描；端点处速度瞬间反向
-
-    :param peak_peak: 峰峰值（int16 原始码值，须 ≥ 0）
-    :param frequency: 频率（Hz），须为正整数
-    :param offset:    中心偏置，默认 0；第 0 帧恰好输出 offset
-    :return:          有符号整数列表（长度 = _WAVE_SAMPLE_RATE_HZ），
-                      已夹限到 ±SETPOINT_LIMIT
-    :raises ValueError: 频率为非正整数
-    """
-    if frequency <= 0:
-        raise ValueError(f"频率必须为正数，收到: {frequency}")
-    if peak_peak < 0:
-        raise ValueError(f"峰峰值不能为负，收到: {peak_peak}")
-
-    freq_int = int(round(frequency))
-    if not math.isclose(frequency, freq_int, abs_tol=1e-9):
-        raise ValueError(
-            f"频率须为整数 Hz（以便与 {WAVE_INTERVAL_MS}ms 采样对齐），收到: {frequency}"
-        )
-
-    # ── 序列长度：固定 1 秒，包含 freq_int 个完整周期 ─────────────────────
-    n = _WAVE_SAMPLE_RATE_HZ   # e.g. 500 @ 2ms → 1 second
-
-    # ── 整数相位三角波 ────────────────────────────────────────────────────
-    # raw = (i × freq_int) % n  → 整数，表示当前帧在 [0, n) 内的相位计数
-    # 归一化 phase = raw / n ∈ [0, 1)
-    # 分四段线性插值（周期从 0 出发）：
-    #   [0.00, 0.25)  → 上升：0 → +amplitude
-    #   [0.25, 0.75)  → 下降：+amplitude → -amplitude
-    #   [0.75, 1.00)  → 上升：-amplitude → 0
-    amplitude = peak_peak / 2.0
-    Q = n // 4   # 四分之一周期的整数相位步数（n=500 时 Q=125）
-
-    result = []
-    for i in range(n):
-        raw = (i * freq_int) % n          # 整数相位 [0, n)
-        if raw < Q:                        # 上升段：0 → +amplitude
-            val = offset + amplitude * raw / Q
-        elif raw < 3 * Q:                  # 下降段：+amplitude → -amplitude
-            val = offset + amplitude * (2.0 - raw / Q)
-        else:                              # 上升段：-amplitude → 0
-            val = offset + amplitude * (raw / Q - 4.0)
-        result.append(max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(val))))
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# 方波设定值生成（巅慧专用）
-# ---------------------------------------------------------------------------
-
-def generate_square_setpoints(
-    peak_peak: float,
-    frequency: float,
-    offset: float = 0.0,
-) -> list[int]:
-    """
-    生成方波位置设定值列表（前半周期正峰值，后半周期负峰值）。
-
-    一个完整周期::
-
-        +peak_peak/2 ... +peak_peak/2 │ -peak_peak/2 ... -peak_peak/2
-        ←── 前半周期（峰值）──────────│──── 后半周期（谷值）──────────→
-
-    序列长度固定 1 秒（_WAVE_SAMPLE_RATE_HZ 点），包含 ``frequency`` 个周期。
-    第 0 帧从正峰值开始。相位使用整数运算 ``(i × freq) % n``。
-
-    :param peak_peak: 峰峰值（int16 原始码值，须 ≥ 0）
-    :param frequency: 频率（Hz），须为正整数
-    :param offset:    中心偏置，默认 0
-    :return:          有符号整数列表（长度 = _WAVE_SAMPLE_RATE_HZ），
-                      每个元素为 offset ± peak_peak/2（已夹限）
-    :raises ValueError: 频率为非正整数
-    """
-    if frequency <= 0:
-        raise ValueError(f"频率必须为正数，收到: {frequency}")
-    if peak_peak < 0:
-        raise ValueError(f"峰峰值不能为负，收到: {peak_peak}")
-
-    freq_int = int(round(frequency))
-    if not math.isclose(frequency, freq_int, abs_tol=1e-9):
-        raise ValueError(
-            f"频率须为整数 Hz（以便与 {WAVE_INTERVAL_MS}ms 采样对齐），收到: {frequency}"
-        )
-
-    n         = _WAVE_SAMPLE_RATE_HZ          # 固定 1 秒
-    amplitude = peak_peak / 2.0
-    half_n    = n // 2                         # 相位计数半周期阈值
-
-    pos_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(offset + amplitude)))
-    neg_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(offset - amplitude)))
-
-    return [
-        pos_val if (i * freq_int) % n < half_n else neg_val
-        for i in range(n)
-    ]
-
-
-# ---------------------------------------------------------------------------
-# 软件正弦波管理器（巅慧专用）
+# 后台发送管理器（模拟位置序列 + 硬件正弦保活）
 # ---------------------------------------------------------------------------
 
 class DianghuiWaveManager:
     """
-    以 1ms 为目标间隔，循环向 DianghuiController 发送预生成的整数设定值列表。
+    以 1ms（1 kHz）为目标间隔，循环向 DianghuiController 只写指令并定时排空接收缓冲。
 
-    双轴独立配置：X 轴和 Y 轴可各自运行不同频率/幅度的正弦，也可只运行一轴。
-    每次 send_control 的返回状态缓存到 last_status，供主线程轮询读取（避免主线程
-    与发送线程争抢串口）。
+    两种互斥工作模式：
+      1. 模拟位置序列：循环下发预生成的闭环位置点列
+      2. 硬件正弦保活：循环下发正弦扫描帧（0x04/0x05/0x06），由下位机生成波形
 
-    典型用法::
-
-        from new_fsc_protocol import generate_sine_setpoints, SAMPLE_INTERVAL_MS_DIANGHUI
-
-        mgr = DianghuiWaveManager(ctrl)
-        pts = generate_sine_setpoints(1000, 20, offset=0, sample_interval_ms=1)
-        mgr.start_wave_x(pts)          # 启动X轴正弦
-        # ... 运行 ...
-        mgr.stop_wave_x(static_value=0)  # 停止并归零
-        mgr.stop_all()                  # 停止后台线程
+    设备每帧都会回状态，必须定时 drain，否则 USB 接收缓冲会溢出。
     """
 
-    _INTERVAL: float = WAVE_INTERVAL_MS / 1000.0  # 目标发送间隔（秒），与采样率同步
+    _INTERVAL: float = WAVE_INTERVAL_MS / 1000.0
 
-    # ── 只写模式（Write-Only）──────────────────────────────────────────────
-    # 发送时不等待设备响应，可将实际间隔从 ~2ms 降至 ~1ms。
-    # 若需要 1ms 控制，同时将顶部 WAVE_INTERVAL_MS 改为 1。
-    WRITE_ONLY_MODE: bool = True   # True=只写（快速）；False=发送+等待响应（~2ms）
-
-    # 是否在波形发送期间解析状态帧并更新状态显示。
-    # True（默认）：每 _STATUS_READ_INTERVAL 秒 drain + 解析，状态灯刷新。
-    # False：每 _DISCARD_INTERVAL 秒仅丢弃缓冲区（不解析），状态灯停止刷新，
-    #        发送线程完全专注写入；注意：即使 False 也必须定期丢弃接收缓冲区，
-    #        否则设备响应以 ~5KB/s（@2ms）积压 0.8-1.6s 后缓冲溢出、USB 通信中断、波形停止。
-    DRAIN_DURING_WAVE:    bool  = True
-    _STATUS_READ_INTERVAL: float = 0.5   # DRAIN_DURING_WAVE=True  时的解析 + 丢弃周期（秒）
-    _DISCARD_INTERVAL:    float = 0.05   # DRAIN_DURING_WAVE=False 时的仅丢弃周期（秒）
+    # 只写 1 kHz；每 50ms 解析一次最新状态帧并清空接收缓冲
+    _STATUS_READ_INTERVAL: float = 0.05
 
     def __init__(self, controller: DianghuiController):
         self._ctrl = controller
@@ -681,22 +579,24 @@ class DianghuiWaveManager:
         self._idx_y:    int = 0
         self._last_status: Optional[DianghuiStatus] = None
 
+        self._sine_mode: Optional[str] = None  # None | 'x' | 'y' | 'xy'
+        self._sine_freq: int = 0
+        self._sine_amp:  int = 0
+
         self._thread:     Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
 
-        self._last_status_read_t: float = 0.0  # 只写模式：上次读取状态的时间
+        self._last_status_read_t: float = 0.0
 
-        # ── 数据记录 ───────────────────────────────────────────────────────
+        self.invert_x: bool = False
+        self.invert_y: bool = False
+
         self._rec_lock:   threading.Lock = threading.Lock()
         self._rec_active: bool           = False
         self._rec_t0:     float          = 0.0
-        self._rec_times:  list[float]    = []   # 相对时间（秒）
-        self._rec_x:      list[int]      = []   # 物理X反馈
-        self._rec_y:      list[int]      = []   # 物理Y反馈
-
-    # ------------------------------------------------------------------
-    # 属性
-    # ------------------------------------------------------------------
+        self._rec_times:  list[float]    = []
+        self._rec_x:      list[int]      = []
+        self._rec_y:      list[int]      = []
 
     @property
     def is_running(self) -> bool:
@@ -704,82 +604,87 @@ class DianghuiWaveManager:
 
     @property
     def last_status(self) -> Optional[DianghuiStatus]:
-        """最近一次 send_control 收到的状态帧（线程安全只读）。"""
         with self._lock:
             return self._last_status
 
-    # ------------------------------------------------------------------
-    # 控制接口
-    # ------------------------------------------------------------------
+    @property
+    def sine_active(self) -> bool:
+        with self._lock:
+            return self._sine_mode is not None
 
     def start_wave_x(self, setpoints: list):
-        """
-        启动物理X轴正弦波。浮点列表自动四舍五入为 int16。
-        如后台线程未在运行则自动启动。
-        """
+        """启动物理X轴模拟位置序列。"""
         pts = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints]
         with self._lock:
+            self._sine_mode = None
             self._pts_x = pts
             self._idx_x = 0
         self._ensure_running()
 
     def start_wave_y(self, setpoints: list):
-        """启动物理Y轴正弦波。"""
+        """启动物理Y轴模拟位置序列。"""
         pts = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints]
         with self._lock:
+            self._sine_mode = None
             self._pts_y = pts
             self._idx_y = 0
         self._ensure_running()
 
     def start_wave_xy(self, setpoints_x: list, setpoints_y: list):
-        """
-        原子性同时启动双轴波形，保证相位完全同步（零相位差）。
-
-        与分别调用 start_wave_x / start_wave_y 相比，此方法在同一把锁内
-        同时将两轴索引归零，消除顺序调用时线程先行推进 X 轴导致的相位偏差。
-
-        例：80Hz 下两轴各差 1 帧（2ms）= 57.6° 相位差，会产生明显椭圆；
-        使用此方法保证 0° 相位差，呈现理想的斜线扫描。
-        """
+        """同时启动双轴模拟位置序列（索引同时归零）。"""
         pts_x = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints_x]
         pts_y = [max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, round(p))) for p in setpoints_y]
-        with self._lock:               # 单次锁内同时归零，线程无法插入
+        with self._lock:
+            self._sine_mode = None
             self._pts_x = pts_x
             self._idx_x = 0
             self._pts_y = pts_y
             self._idx_y = 0
         self._ensure_running()
 
+    def start_hw_sine(self, mode: str, frequency: int, amplitude: int):
+        """
+        启动硬件正弦扫描，并按 1 kHz 保活下发。
+
+        :param mode:      物理轴 'x' / 'y' / 'xy'
+        :param frequency: 频率 Hz（0~5000）
+        :param amplitude: 峰值（界面峰峰值须先 /2）
+        """
+        if mode not in SINE_CMD_PHYS:
+            raise ValueError(f"正弦模式须为 'x'/'y'/'xy'，收到: {mode}")
+        freq = max(0, min(SINE_FREQ_MAX, int(round(frequency))))
+        amp  = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(round(amplitude))))
+        with self._lock:
+            self._pts_x = None
+            self._pts_y = None
+            self._sine_mode = mode
+            self._sine_freq = freq
+            self._sine_amp  = amp
+        self._ensure_running()
+
     def stop_wave_x(self, static_value: int = 0):
-        """停止物理X轴波形，改为发送固定静态值。"""
+        """停止物理X轴模拟序列，改为发送固定静态值。"""
         with self._lock:
             self._pts_x    = None
             self._static_x = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(static_value)))
             self._idx_x    = 0
 
     def stop_wave_y(self, static_value: int = 0):
-        """停止物理Y轴波形，改为发送固定静态值。"""
+        """停止物理Y轴模拟序列，改为发送固定静态值。"""
         with self._lock:
             self._pts_y    = None
             self._static_y = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(static_value)))
             self._idx_y    = 0
 
     def update_static_x(self, value: int):
-        """更新X轴静态目标值（不中断正在运行的波形序列）。"""
         with self._lock:
             self._static_x = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(value)))
 
     def update_static_y(self, value: int):
-        """更新Y轴静态目标值（不中断正在运行的波形序列）。"""
         with self._lock:
             self._static_y = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(value)))
 
-    # ------------------------------------------------------------------
-    # 数据记录
-    # ------------------------------------------------------------------
-
     def start_recording(self) -> None:
-        """开始记录每帧的位置反馈数据，会清空上次的记录。"""
         with self._rec_lock:
             self._rec_times.clear()
             self._rec_x.clear()
@@ -788,7 +693,6 @@ class DianghuiWaveManager:
             self._rec_active = True
 
     def stop_recording(self) -> None:
-        """停止记录。已记录的数据可通过 get_recording / save_recording_csv 获取。"""
         with self._rec_lock:
             self._rec_active = False
 
@@ -802,10 +706,6 @@ class DianghuiWaveManager:
             return len(self._rec_times)
 
     def get_recording(self) -> tuple[list[float], list[int], list[int]]:
-        """
-        返回已记录数据的副本：(时间列表_ms, X轴反馈列表, Y轴反馈列表)。
-        时间单位为毫秒，以第一帧为 0 基准。
-        """
         with self._rec_lock:
             return (
                 [t * 1000.0 for t in self._rec_times],
@@ -814,11 +714,6 @@ class DianghuiWaveManager:
             )
 
     def save_recording_csv(self, path: str) -> int:
-        """
-        将记录数据保存为 CSV 文件。
-        列：时间_ms, X轴反馈_counts, Y轴反馈_counts
-        返回已保存的样本数。
-        """
         import csv as _csv
         times_ms, x_data, y_data = self.get_recording()
         with open(path, 'w', newline='', encoding='utf-8-sig') as f:
@@ -829,7 +724,6 @@ class DianghuiWaveManager:
         return len(times_ms)
 
     def _push_record(self, status: DianghuiStatus) -> None:
-        """（内部）线程中记录一帧位置数据。"""
         if not self._rec_active:
             return
         t = perf_counter() - self._rec_t0
@@ -839,7 +733,7 @@ class DianghuiWaveManager:
             self._rec_y.append(status.y_feedback)
 
     def stop_all(self):
-        """停止所有波形和后台线程（阻塞等待至多 1 秒）。"""
+        """停止所有波形/正弦保活和后台线程（阻塞等待至多 1 秒）。"""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.0)
@@ -847,11 +741,8 @@ class DianghuiWaveManager:
         with self._lock:
             self._pts_x = None
             self._pts_y = None
+            self._sine_mode = None
         self._stop_event.clear()
-
-    # ------------------------------------------------------------------
-    # 后台线程
-    # ------------------------------------------------------------------
 
     def _ensure_running(self):
         if not self.is_running:
@@ -863,91 +754,69 @@ class DianghuiWaveManager:
 
     def _run(self):
         """
-        后台发送循环（1ms 间隔，perf_counter 补偿累积误差）。
+        后台发送循环（1 kHz，perf_counter 补偿）。
 
-        线程仅在至少一轴有活跃波形序列时运行：
-        - 若 _pts_x/_pts_y 不为 None，循环取点（末尾自动回绕）持续发送，
-          镜片保持往复运动，直到 stop_wave_x/y 将其清空。
-        - 若两轴序列均为 None（波形全部停止），线程立即退出。
-          设备在闭环控制下自持当前位置，无需上位机持续下发。
+        硬件正弦：循环下发正弦帧，下位机自行振荡。
+        模拟位置：循环下发闭环位置点列。
+        两种都只写不等待，每 50ms drain 一次接收缓冲，防止溢出。
         """
         next_t = perf_counter()
         while not self._stop_event.is_set():
             with self._lock:
-                active_x = self._pts_x is not None
-                active_y = self._pts_y is not None
+                sine_mode = self._sine_mode
+                sine_freq = self._sine_freq
+                sine_amp  = self._sine_amp
+                active_x  = self._pts_x is not None
+                active_y  = self._pts_y is not None
 
-                # 双轴均无波形 → 退出线程，设备闭环自持位置
-                if not active_x and not active_y:
+                if sine_mode is None and not active_x and not active_y:
                     break
 
-                # X 轴取值
-                if active_x:
-                    x_val       = self._pts_x[self._idx_x]
-                    self._idx_x = (self._idx_x + 1) % len(self._pts_x)
-                else:
-                    x_val = self._static_x
-
-                # Y 轴取值
-                if active_y:
-                    y_val       = self._pts_y[self._idx_y]
-                    self._idx_y = (self._idx_y + 1) % len(self._pts_y)
-                else:
-                    y_val = self._static_y
+                x_val = y_val = 0
+                if sine_mode is None:
+                    if active_x:
+                        x_val       = self._pts_x[self._idx_x]
+                        self._idx_x = (self._idx_x + 1) % len(self._pts_x)
+                    else:
+                        x_val = self._static_x
+                    if active_y:
+                        y_val       = self._pts_y[self._idx_y]
+                        self._idx_y = (self._idx_y + 1) % len(self._pts_y)
+                    else:
+                        y_val = self._static_y
+                    if self.invert_x:
+                        x_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -x_val))
+                    if self.invert_y:
+                        y_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -y_val))
 
             try:
-                if self.WRITE_ONLY_MODE:
-                    # ── 只写路径（~0.1ms/帧，可达 1ms 控制间隔）────────────
+                if sine_mode is not None:
+                    self._ctrl.write_sine_only(sine_mode, sine_freq, sine_amp)
+                else:
                     self._ctrl.write_control_only(x_phys=x_val, y_phys=y_val)
 
-                    # 定期批量读取接收缓冲区（防溢出 + 刷新状态显示）
-                    # DRAIN_DURING_WAVE=False 时跳过，追求最纯粹的发送稳定性
-                    now = perf_counter()
-                    if self.DRAIN_DURING_WAVE:
-                        # 解析模式：drain + 解析状态帧，刷新状态显示
-                        if now - self._last_status_read_t >= self._STATUS_READ_INTERVAL:
-                            self._last_status_read_t = now
-                            status = self._ctrl.drain_read_buffer()
-                            if status is not None:
-                                with self._lock:
-                                    self._last_status = status
-                                self._push_record(status)
-                    else:
-                        # 纯丢弃模式：不解析，仅防止 USB 接收缓冲区溢出导致通信中断
-                        # （设备每帧回 10 字节，@2ms=5KB/s，不丢弃则约 1s 内溢出）
-                        if now - self._last_status_read_t >= self._DISCARD_INTERVAL:
-                            self._last_status_read_t = now
-                            try:
-                                with self._ctrl._lock:
-                                    if (self._ctrl._serial
-                                            and self._ctrl._serial.is_open
-                                            and self._ctrl._serial.in_waiting > 0):
-                                        self._ctrl._serial.reset_input_buffer()
-                            except Exception:
-                                pass
-                else:
-                    # ── 完整收发路径（~2ms/帧，含读等待）────────────────────
-                    status = self._ctrl.send_control(x_phys=x_val, y_phys=y_val)
+                now = perf_counter()
+                if now - self._last_status_read_t >= self._STATUS_READ_INTERVAL:
+                    self._last_status_read_t = now
+                    status = self._ctrl.drain_read_buffer()
                     if status is not None:
                         with self._lock:
                             self._last_status = status
                         self._push_record(status)
             except Exception:
-                break  # 串口异常，退出；主线程轮询会发现断连
+                break
 
             next_t += self._INTERVAL
             remaining = next_t - perf_counter()
-            if remaining > 0:
+            if remaining > 0.002:
                 sleep(remaining)
+            elif remaining > 0:
+                _spin_until(next_t)
 
-        # ── 线程退出前清空接收缓冲区 ──────────────────────────────────────
-        # 波形停止后缓冲区可能残留 ≤100ms 的旧响应帧；
-        # 若不清空，随后的 send_readback() 会读到错位旧数据导致虚假断连。
-        if self.WRITE_ONLY_MODE:
-            try:
-                self._ctrl.drain_read_buffer()
-            except Exception:
-                pass
+        try:
+            self._ctrl.drain_read_buffer()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

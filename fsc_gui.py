@@ -3,9 +3,8 @@
 
 支持两种协议（通过 config.ini [Protocol] type 字段切换）：
   xinmingtian — 芯明天 FSC，波形由硬件生成，支持数字/模拟切换
-  dianghui    — 巅慧，由上位机软件生成正弦/模拟位置序列，
-                按 WAVE_INTERVAL_MS（当前 2ms，USB 一发一收下限）下发；
-                具有轴交换透明处理、8 灯状态面板、模拟位置文件控制
+  dianghui    — 巅慧，闭环位置控制 + 硬件正弦扫描（XY 同时），
+                模拟位置序列按 1 kHz 下发；具有轴交换透明处理、8 灯状态面板
 """
 
 import configparser
@@ -18,6 +17,7 @@ import serial.tools.list_ports
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -41,14 +41,12 @@ from PyQt5.QtWidgets import (
 from dianghui_protocol import (
     DEFAULT_LIMIT as DH_DEFAULT_LIMIT,
     SETPOINT_LIMIT as DH_SETPOINT_LIMIT,
+    SINE_FREQ_MAX as DH_SINE_FREQ_MAX,
     WAVE_INTERVAL_MS as DH_WAVE_INTERVAL_MS,
     DianghuiController,
     DianghuiError,
     DianghuiStatus,
     DianghuiWaveManager,
-    generate_sine_setpoints,
-    generate_square_setpoints,
-    generate_triangle_setpoints,
 )
 from fsc_protocol import FSCController, FSCError, WaveType
 from tcp_server import FSCTcpServer
@@ -67,16 +65,6 @@ WAVE_TYPES = {
     "方波":    WaveType.SQUARE,
     "三角波":  WaveType.TRIANGLE,
     "锯齿波":  WaveType.SAWTOOTH,
-}
-
-# 巅慧软件生成波形类型（字符串标识，与 WaveType 枚举独立）
-DH_WAVE_SINE     = "sine"
-DH_WAVE_TRIANGLE = "triangle"
-DH_WAVE_SQUARE   = "square"
-DH_WAVE_TYPES = {
-    "正弦波":  DH_WAVE_SINE,
-    "三角波":  DH_WAVE_TRIANGLE,
-    "方波":    DH_WAVE_SQUARE,
 }
 
 COMMON_FREQS = [20, 80, 120, 140, 160]
@@ -268,14 +256,7 @@ class WaveChannelWidget(QGroupBox):
         # --- 波形类型 ---
         grid.addWidget(QLabel("波形:"), row, 0)
         self._wave_combo = QComboBox()
-        if is_dh:
-            # 巅慧：软件生成，支持正弦和三角波
-            self._wave_combo.addItems(list(DH_WAVE_TYPES.keys()))
-            self._wave_combo.setToolTip(
-                "正弦波：变速往复，端点平滑；三角波：恒速线性扫描"
-            )
-        else:
-            self._wave_combo.addItems(list(WAVE_TYPES.keys()))
+        self._wave_combo.addItems(list(WAVE_TYPES.keys()))
         self._wave_combo.setMinimumWidth(90)
         grid.addWidget(self._wave_combo, row, 1)
         row += 1
@@ -384,11 +365,8 @@ class WaveChannelWidget(QGroupBox):
     # --- 参数读取（供同步按钮使用） ---
     def get_wave_type(self):
         """返回当前选中的波形类型。
-        巅慧协议返回字符串标识（DH_WAVE_SINE / DH_WAVE_TRIANGLE）；
         芯明天协议返回 WaveType 整数常量。
         """
-        if self._protocol == PROTOCOL_DIANHUI:
-            return DH_WAVE_TYPES.get(self._wave_combo.currentText(), DH_WAVE_SINE)
         return WAVE_TYPES.get(self._wave_combo.currentText(), WaveType.SINE)
 
     def get_peak_peak(self) -> float:
@@ -424,6 +402,122 @@ class WaveChannelWidget(QGroupBox):
     def _on_stop_wave(self):
         if self._stop_wave_cb:
             self._stop_wave_cb(channel=self._channel, displacement=self._last_sent)
+
+
+# ---------------------------------------------------------------------------
+# 巅慧：XY 同时硬件正弦
+# ---------------------------------------------------------------------------
+
+class DhXySineWidget(QGroupBox):
+    """
+    巅慧硬件正弦（指令 0x06）：XY 轴同时扫描。
+
+    界面峰峰值为习惯用法，下发时除以 2 得到协议幅值（峰值）。
+    正弦指令不支持偏置；停止后由主窗口发闭环位置回到设定值。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__("XY 同时正弦扫描", parent)
+        self._send_cb = None
+        self._stop_cb = None
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setSpacing(8)
+        outer.setContentsMargins(10, 14, 10, 10)
+
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        grid.setColumnMinimumWidth(1, 90)
+        row = 0
+
+        grid.addWidget(QLabel("峰峰值:"), row, 0)
+        self._pp_spin = QSpinBox()
+        self._pp_spin.setRange(0, 2 * DH_SETPOINT_LIMIT)
+        self._pp_spin.setSingleStep(10)
+        self._pp_spin.setValue(0)
+        self._pp_spin.setMinimumWidth(90)
+        self._pp_spin.setToolTip(
+            "界面使用峰峰值；下发幅值（峰值）= 峰峰值 / 2，与位置设定值同单位"
+        )
+        grid.addWidget(self._pp_spin, row, 1)
+        grid.addWidget(QLabel("counts"), row, 2)
+        row += 1
+
+        grid.addWidget(QLabel("频率(Hz):"), row, 0)
+        self._freq_spin = QSpinBox()
+        self._freq_spin.setRange(0, DH_SINE_FREQ_MAX)
+        self._freq_spin.setSingleStep(1)
+        self._freq_spin.setValue(20)
+        self._freq_spin.setMinimumWidth(90)
+        self._freq_spin.setToolTip("1 Hz/LSB，范围 0~5000")
+        grid.addWidget(self._freq_spin, row, 1)
+
+        freq_row = QHBoxLayout()
+        freq_row.setSpacing(5)
+        for f in COMMON_FREQS:
+            btn = QPushButton(str(f))
+            btn.setFixedWidth(42)
+            btn.clicked.connect(lambda _checked, v=f: self._freq_spin.setValue(v))
+            freq_row.addWidget(btn)
+        freq_row.addStretch()
+        grid.addLayout(freq_row, row, 2)
+        row += 1
+
+        hint = QLabel("正弦指令不支持偏置；停止后自动回到位移控制区的设定位置。")
+        hint.setStyleSheet("color: #888888; font-size: 12px;")
+        hint.setWordWrap(True)
+        grid.addWidget(hint, row, 0, 1, 3)
+
+        outer.addLayout(grid)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        send_btn = QPushButton("发送正弦")
+        send_btn.setMinimumWidth(100)
+        send_btn.setStyleSheet(
+            "QPushButton{background-color:#1a6b2a;color:white;font-weight:bold;padding:5px 14px;}"
+            "QPushButton:hover{background-color:#238c38;}"
+            "QPushButton:disabled{background-color:#555;color:#999;}"
+        )
+        send_btn.clicked.connect(self._on_send)
+        btn_row.addWidget(send_btn)
+
+        stop_btn = QPushButton("停止正弦")
+        stop_btn.setMinimumWidth(100)
+        stop_btn.setStyleSheet(
+            "QPushButton{background-color:#8b1a1a;color:white;font-weight:bold;padding:5px 14px;}"
+            "QPushButton:hover{background-color:#b52424;}"
+            "QPushButton:disabled{background-color:#555;color:#999;}"
+        )
+        stop_btn.clicked.connect(self._on_stop)
+        btn_row.addWidget(stop_btn)
+
+        outer.addLayout(btn_row)
+
+    def set_callbacks(self, send_cb, stop_cb):
+        self._send_cb = send_cb
+        self._stop_cb = stop_cb
+
+    def get_peak_peak(self) -> int:
+        return int(self._pp_spin.value())
+
+    def get_frequency(self) -> int:
+        return int(self._freq_spin.value())
+
+    def get_amplitude(self) -> int:
+        """协议幅值 = 峰峰值 / 2（峰值）。"""
+        return int(round(self._pp_spin.value() / 2.0))
+
+    def _on_send(self):
+        if self._send_cb:
+            self._send_cb()
+
+    def _on_stop(self):
+        if self._stop_cb:
+            self._stop_cb()
 
 
 # ---------------------------------------------------------------------------
@@ -471,8 +565,11 @@ class MainWindow(QMainWindow):
         self._analog_file_lbl: Optional[QLabel]               = None
         self._analog_play_btn: Optional[QPushButton]          = None
         self._analog_stop_btn: Optional[QPushButton]          = None
-        self._sync_wave_btn:   Optional[QPushButton]          = None
-        self._sync_wave_active: bool                          = False
+        self._dh_sine_widget:  Optional[DhXySineWidget]       = None
+        self._dh_sine_active:  bool                           = False
+        # 轴方向反转（巅慧专用）
+        self._chk_invert_x:    Optional[QCheckBox]          = None
+        self._chk_invert_y:    Optional[QCheckBox]          = None
         # 数据记录（巅慧专用）
         self._rec_btn:         Optional[QPushButton]          = None
         self._rec_count_lbl:   Optional[QLabel]               = None
@@ -717,37 +814,58 @@ class MainWindow(QMainWindow):
             cv.addLayout(ctrl)
             h.addWidget(col)
 
+        # 巅慧：轴方向反转勾选框
+        if self._protocol == PROTOCOL_DIANHUI:
+            inv_row = QHBoxLayout()
+            inv_row.addStretch()
+            inv_row.addWidget(QLabel("轴方向反转:"))
+
+            self._chk_invert_x = QCheckBox("X 轴反向")
+            self._chk_invert_x.setToolTip(
+                "勾选后 X 轴所有输出值取反（翻转 X 方向），可用于匹配其他设备极性"
+            )
+            saved_ix = self._config.getboolean("Protocol", "dianhui_invert_x", fallback=False)
+            self._chk_invert_x.setChecked(saved_ix)
+            self._chk_invert_x.stateChanged.connect(self._on_axis_invert_changed)
+            inv_row.addWidget(self._chk_invert_x)
+
+            self._chk_invert_y = QCheckBox("Y 轴反向")
+            self._chk_invert_y.setToolTip(
+                "勾选后 Y 轴所有输出值取反（翻转 Y 方向），可用于匹配其他设备极性"
+            )
+            saved_iy = self._config.getboolean("Protocol", "dianhui_invert_y", fallback=False)
+            self._chk_invert_y.setChecked(saved_iy)
+            self._chk_invert_y.stateChanged.connect(self._on_axis_invert_changed)
+            inv_row.addWidget(self._chk_invert_y)
+
+            inv_row.addStretch()
+            h.addLayout(inv_row)  # 追加到位移控制区底部
+
         return group
 
     # --- 波形控制区 ---
     def _build_wave_area(self) -> QWidget:
-        title = (f"波形控制（软件正弦，{DH_WAVE_INTERVAL_MS}ms 间隔）"
-                 if self._protocol == PROTOCOL_DIANHUI
-                 else "波形控制（数字模式）")
+        if self._protocol == PROTOCOL_DIANHUI:
+            title = "波形控制（硬件正弦，XY 同时）"
+        else:
+            title = "波形控制（数字模式）"
         group = QGroupBox(title)
         v = QVBoxLayout(group)
         v.setSpacing(6)
 
         self._wave_widgets: list[WaveChannelWidget] = []
-        for ch in range(2):
-            w = WaveChannelWidget(ch, protocol_type=self._protocol)
-            w.set_callbacks(self._send_wave, self._stop_wave)
-            v.addWidget(w)
-            self._wave_widgets.append(w)
-
-        # 巅慧专属：双轴同步启停按钮
         if self._protocol == PROTOCOL_DIANHUI:
-            line = QFrame()
-            line.setFrameShape(QFrame.HLine)
-            line.setStyleSheet("color: #444444;")
-            v.addWidget(line)
+            self._dh_sine_widget = DhXySineWidget()
+            self._dh_sine_widget.set_callbacks(self._send_dh_sine, self._stop_dh_sine)
+            v.addWidget(self._dh_sine_widget)
+        else:
+            for ch in range(2):
+                w = WaveChannelWidget(ch, protocol_type=self._protocol)
+                w.set_callbacks(self._send_wave, self._stop_wave)
+                v.addWidget(w)
+                self._wave_widgets.append(w)
 
-            self._sync_wave_btn = QPushButton("▶   双轴同步发送")
-            self._sync_wave_btn.setMinimumHeight(44)
-            self._sync_wave_btn.setStyleSheet(self._sync_btn_style(active=False))
-            self._sync_wave_btn.clicked.connect(self._on_sync_wave_toggle)
-            v.addWidget(self._sync_wave_btn)
-
+        if self._protocol == PROTOCOL_DIANHUI:
             # ── 数据记录行 ─────────────────────────────────────────────
             line2 = QFrame()
             line2.setFrameShape(QFrame.HLine)
@@ -829,6 +947,11 @@ class MainWindow(QMainWindow):
                 self._dh = DianghuiController(port=port, baudrate=baudrate)
                 self._dh.open()
                 self._dh_wave_mgr = DianghuiWaveManager(self._dh)
+                # 恢复轴反向设置
+                if self._chk_invert_x:
+                    self._dh_wave_mgr.invert_x = self._chk_invert_x.isChecked()
+                if self._chk_invert_y:
+                    self._dh_wave_mgr.invert_y = self._chk_invert_y.isChecked()
             else:
                 address = self._addr_spin.value() if self._addr_spin else 1
                 self._fsc = FSCController(port=port, address=address, baudrate=baudrate)
@@ -890,11 +1013,7 @@ class MainWindow(QMainWindow):
             self._analog_play_btn.setEnabled(has_data)
         if self._analog_stop_btn:
             self._analog_stop_btn.setEnabled(False)
-        # 重置同步按钮状态
-        self._sync_wave_active = False
-        if self._sync_wave_btn:
-            self._sync_wave_btn.setText("▶   双轴同步发送")
-            self._sync_wave_btn.setStyleSheet(self._sync_btn_style(active=False))
+        self._dh_sine_active = False
         if self._dh_status_panel:
             self._dh_status_panel.set_unknown()
 
@@ -1089,12 +1208,26 @@ class MainWindow(QMainWindow):
         val = int("".join(digits))
         return val if val > 0 else None
 
+    def _on_axis_invert_changed(self):
+        """轴反向勾选框变更：实时同步到波形管理器并保存配置。"""
+        invert_x = bool(self._chk_invert_x and self._chk_invert_x.isChecked())
+        invert_y = bool(self._chk_invert_y and self._chk_invert_y.isChecked())
+        if self._dh_wave_mgr:
+            self._dh_wave_mgr.invert_x = invert_x
+            self._dh_wave_mgr.invert_y = invert_y
+        self._config.set("Protocol", "dianhui_invert_x", str(invert_x))
+        self._config.set("Protocol", "dianhui_invert_y", str(invert_y))
+        self._save_config()
+        x_str = "反向" if invert_x else "正向"
+        y_str = "反向" if invert_y else "正向"
+        self._status_bar.showMessage(f"轴极性更新: X={x_str}  Y={y_str}（实时生效）")
+
     def _on_load_analog_pos(self):
         """
         加载模拟位置 CSV（两列 X,Y）。
 
         文件默认按 1ms 采样编写（1 秒 = 1000 行）；加载后按 WAVE_INTERVAL_MS
-        （当前 USB 一发一收约 2ms）抽点，保证轨迹时长不变。
+        （当前 1ms / 1 kHz）抽点，保证轨迹时长不变。
         若注释中写有 ``sample_interval_ms: N``，则按该间隔抽点。
         """
         path, _ = QFileDialog.getOpenFileName(
@@ -1176,24 +1309,31 @@ class MainWindow(QMainWindow):
         if not (self._analog_pos_x and self._analog_pos_y):
             self._show_error("请先加载位置文件")
             return
-        self._dh_wave_mgr.start_wave_x(self._analog_pos_x)
-        self._dh_wave_mgr.start_wave_y(self._analog_pos_y)
-        if self._analog_stop_btn:
-            self._analog_stop_btn.setEnabled(True)
+        self._dh_sine_active = False
+        self._dh_wave_mgr.start_wave_xy(self._analog_pos_x, self._analog_pos_y)
         n = len(self._analog_pos_x)
         duration_s = n * DH_WAVE_INTERVAL_MS / 1000.0
         self._status_bar.showMessage(
             f"模拟位置发送中: X/Y 各 {n} 点，间隔 {DH_WAVE_INTERVAL_MS}ms，"
             f"时长 {duration_s:.2f}s 循环"
         )
+        if self._analog_stop_btn:
+            self._analog_stop_btn.setEnabled(True)
 
     def _on_stop_analog_pos(self):
         if self._dh_wave_mgr:
-            self._dh_wave_mgr.stop_wave_x(static_value=0)
-            self._dh_wave_mgr.stop_wave_y(static_value=0)
+            self._dh_wave_mgr.stop_all()
+        if self._dh:
+            x_val = round(self._disp_spin_0.value())
+            y_val = round(self._disp_spin_1.value())
+            try:
+                self._dh.send_control(x_phys=x_val, y_phys=y_val)
+            except _COMM_ERRORS as exc:
+                self._show_error(f"停止模拟位置失败: {exc}")
+                return
         if self._analog_stop_btn:
             self._analog_stop_btn.setEnabled(False)
-        self._status_bar.showMessage("模拟位置已停止")
+        self._status_bar.showMessage("模拟位置已停止，已返回设定位置")
 
     # ================================================================
     # 远程指令触发的 UI 更新（主线程槽，由信号安全调用）
@@ -1214,7 +1354,8 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"[远程] 开闭环: {'闭环' if is_closed else '开环'}")
 
     def _apply_disp_from_remote(self, channel: int, displacement: float):
-        self._wave_widgets[channel].update_last_sent(displacement)
+        if 0 <= channel < len(self._wave_widgets):
+            self._wave_widgets[channel].update_last_sent(displacement)
         self._status_bar.showMessage(f"[远程] 通道 {channel} 位移: {displacement:.3f}")
 
     # ================================================================
@@ -1292,8 +1433,9 @@ class MainWindow(QMainWindow):
         lcd1.set_int_value(status.y_feedback)
         self._displacement[0] = float(status.x_feedback)
         self._displacement[1] = float(status.y_feedback)
-        self._wave_widgets[0].update_displacement(float(status.x_feedback))
-        self._wave_widgets[1].update_displacement(float(status.y_feedback))
+        if len(self._wave_widgets) >= 2:
+            self._wave_widgets[0].update_displacement(float(status.x_feedback))
+            self._wave_widgets[1].update_displacement(float(status.y_feedback))
         if self._dh_status_panel:
             self._dh_status_panel.update_status(status)
 
@@ -1315,17 +1457,17 @@ class MainWindow(QMainWindow):
                     self._show_error("串口未连接")
                     return
                 ival = round(val)
-                # 另一轴始终从各自的位移输入框读目标值，避免用到正弦瞬时值
                 other_ch = 1 - channel
                 other_spin: QDoubleSpinBox = getattr(self, f"_disp_spin_{other_ch}")
                 other_ival = round(other_spin.value())
-                # 同步波形管理器的静态值（不中断另一轴正在运行的波形）
                 if self._dh_wave_mgr:
+                    if self._dh_wave_mgr.sine_active:
+                        self._dh_wave_mgr.stop_all()
+                        self._dh_sine_active = False
                     if channel == 0:
                         self._dh_wave_mgr.update_static_x(ival)
                     else:
                         self._dh_wave_mgr.update_static_y(ival)
-                # 直接发一帧立即到达目标（若波形管理器在运行会在下一发送周期接管）
                 if channel == 0:
                     self._dh.send_control(x_phys=ival, y_phys=other_ival)
                 else:
@@ -1336,94 +1478,87 @@ class MainWindow(QMainWindow):
                     return
                 self._fsc.send_displacement(channel=channel, displacement=val)
 
-            self._wave_widgets[channel].update_last_sent(val)
+            if 0 <= channel < len(self._wave_widgets):
+                self._wave_widgets[channel].update_last_sent(val)
             self._status_bar.showMessage(f"通道 {channel} 位移已发送: {val:.3f}")
         except _COMM_ERRORS as exc:
             self._show_error(f"发送位移失败: {exc}")
 
     # ================================================================
-    # 波形控制（由 WaveChannelWidget 回调）
+    # 波形控制
     # ================================================================
+
+    def _send_dh_sine(self):
+        """发送 XY 同时硬件正弦（指令 0x06）。界面峰峰值 / 2 后作为协议幅值。"""
+        if not (self._dh and self._dh_wave_mgr and self._dh_sine_widget):
+            self._show_error("串口未连接")
+            return
+        try:
+            peak_peak = self._dh_sine_widget.get_peak_peak()
+            frequency = self._dh_sine_widget.get_frequency()
+            amplitude = self._dh_sine_widget.get_amplitude()
+            if self._analog_stop_btn:
+                self._analog_stop_btn.setEnabled(False)
+            self._dh_wave_mgr.start_hw_sine("xy", frequency, amplitude)
+            self._dh_sine_active = True
+            self._status_bar.showMessage(
+                f"XY 同时正弦: 峰峰={peak_peak} → 幅值(峰值)={amplitude}  "
+                f"频率={frequency}Hz  1kHz 保活"
+            )
+        except _COMM_ERRORS as exc:
+            self._show_error(f"发送正弦失败: {exc}")
+        except ValueError as exc:
+            self._show_error(f"参数错误: {exc}")
+
+    def _stop_dh_sine(self):
+        """停止硬件正弦，线程退出后再发闭环位置，回到位移控制区设定值。"""
+        if not (self._dh and self._dh_wave_mgr):
+            self._show_error("串口未连接")
+            return
+        try:
+            x_val = round(self._disp_spin_0.value())
+            y_val = round(self._disp_spin_1.value())
+            self._dh_wave_mgr.stop_all()
+            self._dh.send_control(x_phys=x_val, y_phys=y_val)
+            self._dh_sine_active = False
+            self._status_bar.showMessage(
+                f"正弦已停止，已返回设定位置 X={x_val} Y={y_val} counts"
+            )
+        except _COMM_ERRORS as exc:
+            self._show_error(f"停止正弦失败: {exc}")
 
     def _send_wave(self, channel: int, wave_type: int,
                    peak_peak: float, frequency: float, offset: float):
+        """芯明天通道波形。"""
         try:
-            if self._protocol == PROTOCOL_DIANHUI:
-                if not (self._dh and self._dh_wave_mgr):
-                    self._show_error("串口未连接")
-                    return
-                # 根据所选波形类型生成设定值序列
-                if wave_type == DH_WAVE_TRIANGLE:
-                    pts      = generate_triangle_setpoints(peak_peak, frequency, offset)
-                    type_str = "三角波"
-                elif wave_type == DH_WAVE_SQUARE:
-                    pts      = generate_square_setpoints(peak_peak, frequency, offset)
-                    type_str = "方波"
-                else:
-                    pts      = generate_sine_setpoints(peak_peak, frequency, offset)
-                    type_str = "正弦波"
-                if channel == 0:
-                    self._dh_wave_mgr.start_wave_x(pts)
-                else:
-                    self._dh_wave_mgr.start_wave_y(pts)
-                self._status_bar.showMessage(
-                    f"通道 {channel} {type_str}: 峰峰={peak_peak}  频率={frequency}Hz"
-                    f"  偏置={offset}  周期点数={len(pts)}"
-                    f"  采样间隔={DH_WAVE_INTERVAL_MS}ms"
-                )
-            else:
-                if not self._fsc:
-                    self._show_error("串口未连接")
-                    return
-                self._fsc.send_wave_displacement(
-                    channel   = channel,
-                    wave_type = wave_type,
-                    peak_peak = peak_peak,
-                    frequency = frequency,
-                    offset    = offset,
-                )
-                self._status_bar.showMessage(
-                    f"通道 {channel} 波形已发送: 峰峰={peak_peak}  频率={frequency}Hz  偏置={offset}"
-                )
+            if not self._fsc:
+                self._show_error("串口未连接")
+                return
+            self._fsc.send_wave_displacement(
+                channel   = channel,
+                wave_type = wave_type,
+                peak_peak = peak_peak,
+                frequency = frequency,
+                offset    = offset,
+            )
+            self._status_bar.showMessage(
+                f"通道 {channel} 波形已发送: 峰峰={peak_peak}  频率={frequency}Hz  偏置={offset}"
+            )
         except _COMM_ERRORS as exc:
             self._show_error(f"发送波形失败: {exc}")
         except ValueError as exc:
             self._show_error(f"参数错误: {exc}")
 
     def _stop_wave(self, channel: int, displacement: float):
+        """芯明天停止波形。"""
         try:
-            if self._protocol == PROTOCOL_DIANHUI:
-                if not (self._dh and self._dh_wave_mgr):
-                    self._show_error("串口未连接")
-                    return
-                # 从位移控制面板读当前目标值（而非历史 last_sent）
-                target_spin: QDoubleSpinBox = getattr(self, f"_disp_spin_{channel}")
-                ival = round(target_spin.value())
-                other_ch = 1 - channel
-                other_spin: QDoubleSpinBox = getattr(self, f"_disp_spin_{other_ch}")
-                other_ival = round(other_spin.value())
-                # 停止该轴波形，设回目标静态值
-                if channel == 0:
-                    self._dh_wave_mgr.stop_wave_x(static_value=ival)
-                else:
-                    self._dh_wave_mgr.stop_wave_y(static_value=ival)
-                # 立即发一帧使设备快速到达目标位置（闭环）
-                if channel == 0:
-                    self._dh.send_control(x_phys=ival, y_phys=other_ival)
-                else:
-                    self._dh.send_control(x_phys=other_ival, y_phys=ival)
-                self._wave_widgets[channel].update_last_sent(float(ival))
-                self._status_bar.showMessage(
-                    f"通道 {channel} 波形已停止，已返回目标位置 {ival} counts（闭环）"
-                )
-            else:
-                if not self._fsc:
-                    self._show_error("串口未连接")
-                    return
-                self._fsc.send_displacement(channel=channel, displacement=displacement)
-                self._status_bar.showMessage(
-                    f"通道 {channel} 波形已停止（位移={displacement:.3f}）"
-                )
+            if not self._fsc:
+                self._show_error("串口未连接")
+                return
+            self._fsc.send_displacement(channel=channel, displacement=displacement)
+            self._status_bar.showMessage(
+                f"通道 {channel} 波形已停止（位移={displacement:.3f}）"
+            )
         except _COMM_ERRORS as exc:
             self._show_error(f"停止波形失败: {exc}")
 
@@ -1522,88 +1657,6 @@ class MainWindow(QMainWindow):
             self._show_error(f"保存失败: {exc}")
 
     # ================================================================
-    # 双轴同步启停（巅慧专用）
-    # ================================================================
-
-    @staticmethod
-    def _sync_btn_style(active: bool) -> str:
-        if active:
-            return (
-                "QPushButton{background-color:#8b1a1a;color:white;font-size:16px;"
-                "font-weight:bold;border-radius:6px;padding:6px 0;}"
-                "QPushButton:hover{background-color:#b52424;}"
-                "QPushButton:disabled{background-color:#555;color:#999;}"
-            )
-        else:
-            return (
-                "QPushButton{background-color:#1a5c2e;color:white;font-size:16px;"
-                "font-weight:bold;border-radius:6px;padding:6px 0;}"
-                "QPushButton:hover{background-color:#247a3e;}"
-                "QPushButton:disabled{background-color:#555;color:#999;}"
-            )
-
-    def _on_sync_wave_toggle(self):
-        """双轴同步启停：一键同时对两个通道执行发送或停止。"""
-        if not self._sync_wave_active:
-            self._sync_start_all()
-        else:
-            self._sync_stop_all()
-
-    def _sync_start_all(self):
-        """
-        原子性同步启动双轴波形（零相位差）。
-
-        先生成双轴所有设定值点列，再通过 start_wave_xy() 在单次锁内同时归零两轴索引，
-        彻底消除顺序调用 start_wave_x/y 时因线程先行推进导致的相位偏差。
-        """
-        if not (self._dh and self._dh_wave_mgr):
-            self._show_error("串口未连接")
-            return
-        try:
-            # ── 第一步：在线程启动前提前生成双轴数据 ───────────────────────
-            pts_per_ch: dict[int, list] = {}
-            for ch in range(2):
-                w = self._wave_widgets[ch]
-                wave_type = w.get_wave_type()
-                peak_peak = w.get_peak_peak()
-                frequency = w.get_frequency()
-                offset    = w.get_offset()
-                if wave_type == DH_WAVE_TRIANGLE:
-                    pts = generate_triangle_setpoints(peak_peak, frequency, offset)
-                elif wave_type == DH_WAVE_SQUARE:
-                    pts = generate_square_setpoints(peak_peak, frequency, offset)
-                else:
-                    pts = generate_sine_setpoints(peak_peak, frequency, offset)
-                pts_per_ch[ch] = pts
-
-            # ── 第二步：原子性同步启动，X/Y 索引同时归零 ─────────────────
-            self._dh_wave_mgr.start_wave_xy(pts_per_ch[0], pts_per_ch[1])
-
-            self._sync_wave_active = True
-            if self._sync_wave_btn:
-                self._sync_wave_btn.setText("■   双轴同步停止")
-                self._sync_wave_btn.setStyleSheet(self._sync_btn_style(active=True))
-            w0 = self._wave_widgets[0]
-            self._status_bar.showMessage(
-                f"双轴同步启动: {w0.get_frequency():.0f}Hz  "
-                f"各 {len(pts_per_ch[0])} 点  相位同步"
-            )
-        except ValueError as exc:
-            self._show_error(f"参数错误: {exc}")
-        except Exception as exc:
-            self._show_error(f"启动波形失败: {exc}")
-
-    def _sync_stop_all(self):
-        """同时停止两个通道的波形，各自返回位移面板的目标位置。"""
-        for ch in range(2):
-            self._stop_wave(channel=ch, displacement=0)  # displacement 在巅慧下从spinbox读
-        self._sync_wave_active = False
-        if self._sync_wave_btn:
-            self._sync_wave_btn.setText("▶   双轴同步发送")
-            self._sync_wave_btn.setStyleSheet(self._sync_btn_style(active=False))
-        self._status_bar.showMessage("双轴波形已同步停止，已返回目标位置")
-
-    # ================================================================
     # TCP 服务端
     # ================================================================
 
@@ -1673,22 +1726,20 @@ class MainWindow(QMainWindow):
             frequency = float(p.get("frequency", 20.0))
             offset    = float(p.get("offset", 0.0))
             if self._protocol == PROTOCOL_DIANHUI:
+                if not self._dh_wave_mgr:
+                    raise RuntimeError("巅慧波形管理器未启动")
                 wave_str = str(p.get("wave_type", "sine")).lower()
-                if wave_str == "triangle":
-                    pts      = generate_triangle_setpoints(peak_peak, frequency, offset)
-                    type_str = "三角波"
-                elif wave_str == "square":
-                    pts      = generate_square_setpoints(peak_peak, frequency, offset)
-                    type_str = "方波"
-                else:
-                    pts      = generate_sine_setpoints(peak_peak, frequency, offset)
-                    type_str = "正弦波"
-                if ch == 0:
-                    self._dh_wave_mgr.start_wave_x(pts)
-                else:
-                    self._dh_wave_mgr.start_wave_y(pts)
+                if wave_str not in ("sine", "sin"):
+                    raise ValueError("巅慧仅支持硬件正弦（wave_type=sine）")
+                axis = str(p.get("axis", p.get("mode", "xy"))).lower()
+                if axis not in ("x", "y", "xy"):
+                    axis = "x" if ch == 0 else "y"
+                amplitude = int(round(peak_peak / 2.0))
+                self._dh_wave_mgr.start_hw_sine(axis, int(round(frequency)), amplitude)
+                self._dh_sine_active = True
                 self._sig_status_msg.emit(
-                    f"[远程] 通道 {ch} {type_str}: 峰峰={peak_peak} 频率={frequency}Hz"
+                    f"[远程] 硬件正弦 {axis}: 峰峰={peak_peak} → 峰值={amplitude} "
+                    f"频率={int(round(frequency))}Hz（无偏置）"
                 )
             else:
                 wave_str = str(p.get("wave_type", "sine")).lower()
@@ -1712,11 +1763,16 @@ class MainWindow(QMainWindow):
             ch   = int(p.get("channel", 0))
             disp = float(p.get("displacement", 0.0))
             if self._protocol == PROTOCOL_DIANHUI:
+                if not self._dh_wave_mgr:
+                    raise RuntimeError("巅慧波形管理器未启动")
                 ival = round(disp)
                 if ch == 0:
-                    self._dh_wave_mgr.stop_wave_x(ival)
+                    x_val, y_val = ival, self._dh.y_setpoint
                 else:
-                    self._dh_wave_mgr.stop_wave_y(ival)
+                    x_val, y_val = self._dh.x_setpoint, ival
+                self._dh_wave_mgr.stop_all()
+                self._dh.send_control(x_phys=x_val, y_phys=y_val)
+                self._dh_sine_active = False
             else:
                 self._fsc.send_displacement(channel=ch, displacement=disp)
             self._sig_disp_sent.emit(ch, disp)
