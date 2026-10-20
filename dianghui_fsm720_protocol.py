@@ -90,9 +90,13 @@ SETPOINT_LIMIT = 25000  # 程序软限位：X/Y 轴设定值不超过 ±25000
 SINE_FREQ_MAX  = 5000   # 正弦频率上限（Hz），1 Hz/LSB
 
 # ---------------------------------------------------------------------------
-# 发送间隔配置（模拟位置序列 / 正弦保活）
+# 发送间隔配置
 # ---------------------------------------------------------------------------
-# 只写模式下目标间隔 1ms（1 kHz）。设备每帧都会回状态，须定时 drain 防溢出。
+# 模拟位置序列：500 Hz（2ms）。控制器单次闭环约 0.2ms，500Hz 留有余量。
+ANALOG_INTERVAL_MS: int = 2
+# 模拟发送每个点连发帧数（1 = 单帧，>1 = 连发）。
+ANALOG_BURST_N: int = 5
+# 硬件正弦保活：1 kHz（1ms），与模拟发送独立。
 WAVE_INTERVAL_MS: int = 1
 
 
@@ -389,9 +393,21 @@ class DianghuiController:
             self.write_control_only(x_phys, y_phys)
 
     def write_control_burst(self, pairs: list[tuple[int, int]]) -> None:
-        """兼容旧接口：改为均匀节拍发送（等价 write_control_paced）。"""
-        slot_s = (WAVE_INTERVAL_MS / 1000.0) / max(1, len(pairs))
-        self.write_control_paced(pairs, slot_s=slot_s, t0=perf_counter())
+        """
+        一次串口写入连续多帧闭环指令（模拟连发）。
+
+        组帧在内存中完成，只调用一次 serial.write，UART 上背靠背发出。
+        """
+        if not pairs:
+            return
+        blob = bytearray()
+        with self._lock:
+            assert self._serial and self._serial.is_open, "串口未打开"
+            for x_phys, y_phys in pairs:
+                self._x_phys = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(x_phys)))
+                self._y_phys = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, int(y_phys)))
+                blob += self._build_closed_loop_frame()
+            self._serial.write(blob)
 
     def drain_read_buffer(self) -> Optional[DianghuiStatus]:
         """
@@ -553,18 +569,20 @@ class DianghuiController:
 
 class DianghuiWaveManager:
     """
-    以 1ms（1 kHz）为目标间隔，循环向 DianghuiController 只写指令并定时排空接收缓冲。
+    循环向 DianghuiController 只写指令并定时排空接收缓冲。
 
-    两种互斥工作模式：
-      1. 模拟位置序列：循环下发预生成的闭环位置点列
-      2. 硬件正弦保活：循环下发正弦扫描帧（0x04/0x05/0x06），由下位机生成波形
+    两种互斥工作模式（发送间隔独立）：
+      1. 模拟位置序列：500 Hz（ANALOG_INTERVAL_MS）循环下发闭环位置点列，
+         每个点 ANALOG_BURST_N 帧连发（当前 10 帧；硬件正弦不走连发）
+      2. 硬件正弦保活：1 kHz（WAVE_INTERVAL_MS）循环下发正弦扫描帧（0x04/0x05/0x06）
 
     设备每帧都会回状态，必须定时 drain，否则 USB 接收缓冲会溢出。
     """
 
     _INTERVAL: float = WAVE_INTERVAL_MS / 1000.0
+    _ANALOG_INTERVAL: float = ANALOG_INTERVAL_MS / 1000.0
 
-    # 只写 1 kHz；每 50ms 解析一次最新状态帧并清空接收缓冲
+    # 每 50ms 解析一次最新状态帧并清空接收缓冲
     _STATUS_READ_INTERVAL: float = 0.05
 
     def __init__(self, controller: DianghuiController):
@@ -590,6 +608,9 @@ class DianghuiWaveManager:
 
         self.invert_x: bool = False
         self.invert_y: bool = False
+        self.analog_burst: bool = True        # True=每点连发 ANALOG_BURST_N 帧；False=单帧
+        self.analog_interval_ms: int = ANALOG_INTERVAL_MS  # 发送间隔(ms)：2=500Hz，1=1000Hz
+        self.analog_interpolate: bool = False  # True=连发时线性插值；False=重复同一点
 
         self._rec_lock:   threading.Lock = threading.Lock()
         self._rec_active: bool           = False
@@ -754,11 +775,11 @@ class DianghuiWaveManager:
 
     def _run(self):
         """
-        后台发送循环（1 kHz，perf_counter 补偿）。
+        后台发送循环（perf_counter 补偿）。
 
-        硬件正弦：循环下发正弦帧，下位机自行振荡。
-        模拟位置：循环下发闭环位置点列。
-        两种都只写不等待，每 50ms drain 一次接收缓冲，防止溢出。
+        硬件正弦：1 kHz 循环下发正弦帧，下位机自行振荡（单帧，不连发）。
+        模拟位置：500 Hz 取点，每个点连发 ANALOG_BURST_N 帧闭环指令。
+        两种都只写不等待，定时 drain 接收缓冲，防止溢出。
         """
         next_t = perf_counter()
         while not self._stop_event.is_set():
@@ -772,31 +793,66 @@ class DianghuiWaveManager:
                 if sine_mode is None and not active_x and not active_y:
                     break
 
-                x_val = y_val = 0
+                x_cur = x_next = 0
+                y_cur = y_next = 0
                 if sine_mode is None:
                     if active_x:
-                        x_val       = self._pts_x[self._idx_x]
-                        self._idx_x = (self._idx_x + 1) % len(self._pts_x)
+                        x_cur        = self._pts_x[self._idx_x]
+                        x_next       = self._pts_x[(self._idx_x + 1) % len(self._pts_x)]
+                        self._idx_x  = (self._idx_x + 1) % len(self._pts_x)
                     else:
-                        x_val = self._static_x
+                        x_cur = x_next = self._static_x
                     if active_y:
-                        y_val       = self._pts_y[self._idx_y]
-                        self._idx_y = (self._idx_y + 1) % len(self._pts_y)
+                        y_cur        = self._pts_y[self._idx_y]
+                        y_next       = self._pts_y[(self._idx_y + 1) % len(self._pts_y)]
+                        self._idx_y  = (self._idx_y + 1) % len(self._pts_y)
                     else:
-                        y_val = self._static_y
+                        y_cur = y_next = self._static_y
+                    # 极性反转（对当前点和下一点都处理，保证插值方向正确）
                     if self.invert_x:
-                        x_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -x_val))
+                        x_cur  = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -x_cur))
+                        x_next = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -x_next))
                     if self.invert_y:
-                        y_val = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -y_val))
+                        y_cur  = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -y_cur))
+                        y_next = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, -y_next))
+                # 在锁内快照动态配置，避免发送途中被主线程修改
+                do_burst       = self.analog_burst
+                do_interpolate = self.analog_interpolate
+                analog_iv_ms   = self.analog_interval_ms
 
             try:
                 if sine_mode is not None:
+                    # 硬件正弦保活：单帧，1 kHz
                     self._ctrl.write_sine_only(sine_mode, sine_freq, sine_amp)
+                    interval = self._INTERVAL
+                    drain_iv = self._STATUS_READ_INTERVAL
+                elif do_burst:
+                    # 连发模式：ANALOG_BURST_N 帧 / 点
+                    if do_interpolate:
+                        # 线性插值：当前点 → 下一点，生成 N 个不同值
+                        n = ANALOG_BURST_N
+                        pairs: list[tuple[int, int]] = []
+                        for i in range(n):
+                            t  = i / n
+                            xi = round(x_cur + t * (x_next - x_cur))
+                            yi = round(y_cur + t * (y_next - y_cur))
+                            xi = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, xi))
+                            yi = max(-SETPOINT_LIMIT, min(SETPOINT_LIMIT, yi))
+                            pairs.append((xi, yi))
+                    else:
+                        # 重复同一点
+                        pairs = [(x_cur, y_cur)] * ANALOG_BURST_N
+                    self._ctrl.write_control_burst(pairs)
+                    interval = analog_iv_ms / 1000.0
+                    drain_iv = min(self._STATUS_READ_INTERVAL, 0.02)
                 else:
-                    self._ctrl.write_control_only(x_phys=x_val, y_phys=y_val)
+                    # 单帧模式
+                    self._ctrl.write_control_only(x_phys=x_cur, y_phys=y_cur)
+                    interval = analog_iv_ms / 1000.0
+                    drain_iv = self._STATUS_READ_INTERVAL
 
                 now = perf_counter()
-                if now - self._last_status_read_t >= self._STATUS_READ_INTERVAL:
+                if now - self._last_status_read_t >= drain_iv:
                     self._last_status_read_t = now
                     status = self._ctrl.drain_read_buffer()
                     if status is not None:
@@ -806,7 +862,7 @@ class DianghuiWaveManager:
             except Exception:
                 break
 
-            next_t += self._INTERVAL
+            next_t += interval
             remaining = next_t - perf_counter()
             if remaining > 0.002:
                 sleep(remaining)
